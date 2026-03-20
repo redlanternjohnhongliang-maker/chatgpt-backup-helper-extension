@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Backup Helper",
-  "version": "0.2.1",
-  "description": "Export current or bulk ChatGPT conversations with attachment manifests.",
+  "version": "0.3.0",
+  "description": "Export current or bulk ChatGPT conversations with local attachment packaging.",
   "permissions": [
     "tabs"
   ],
@@ -21,6 +21,7 @@
         "https://chat.openai.com/*"
       ],
       "js": [
+        "vendor/jszip.min.js",
         "content.js"
       ],
       "run_at": "document_idle"

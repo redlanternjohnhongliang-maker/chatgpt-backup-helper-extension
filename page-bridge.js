@@ -14,7 +14,12 @@
 
     try {
       const result = await handleAction(action, payload || {});
-      window.postMessage({ type: RESPONSE_TYPE, requestId, ok: true, result }, "*");
+      const transfer = collectTransferables(result);
+      if (transfer.length) {
+        window.postMessage({ type: RESPONSE_TYPE, requestId, ok: true, result }, "*", transfer);
+      } else {
+        window.postMessage({ type: RESPONSE_TYPE, requestId, ok: true, result }, "*");
+      }
     } catch (error) {
       window.postMessage(
         {
@@ -36,6 +41,8 @@
         return fetchConversationDetail(payload);
       case "resolve-file-download-urls":
         return resolveFileDownloadUrls(payload);
+      case "fetch-binary-resource":
+        return fetchBinaryResource(payload);
       default:
         throw new Error(`Unsupported action: ${action}`);
     }
@@ -161,6 +168,100 @@
       candidates: fallbackCandidates,
       source: "fallback"
     };
+  }
+
+  async function fetchBinaryResource(payload) {
+    const candidates = uniqueStrings([
+      payload?.url,
+      ...(Array.isArray(payload?.candidates) ? payload.candidates : [])
+    ]);
+
+    if (!candidates.length) {
+      throw new Error("No binary resource URL candidates were provided.");
+    }
+
+    let lastError = null;
+
+    for (const candidate of candidates) {
+      try {
+        const response = await fetchWithAuth(candidate, {
+          headers: {
+            Accept: "*/*"
+          }
+        });
+
+        if (!response.ok) {
+          throw new Error(`Request failed: ${response.status} ${response.statusText}`);
+        }
+
+        return {
+          sourceUrl: candidate,
+          finalUrl: response.url || candidate,
+          contentType: response.headers.get("content-type") || "",
+          contentDisposition: response.headers.get("content-disposition") || "",
+          fileName:
+            extractFilenameFromContentDisposition(response.headers.get("content-disposition") || "") ||
+            extractFilenameFromUrl(response.url || candidate),
+          bytes: await response.arrayBuffer()
+        };
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    throw lastError || new Error("All binary resource candidates failed.");
+  }
+
+  function collectTransferables(value, results = []) {
+    if (!value) {
+      return results;
+    }
+
+    if (value instanceof ArrayBuffer) {
+      results.push(value);
+      return results;
+    }
+
+    if (Array.isArray(value)) {
+      value.forEach((item) => collectTransferables(item, results));
+      return results;
+    }
+
+    if (typeof value !== "object") {
+      return results;
+    }
+
+    Object.values(value).forEach((child) => collectTransferables(child, results));
+    return results;
+  }
+
+  function extractFilenameFromContentDisposition(value) {
+    const header = String(value || "");
+    if (!header) {
+      return "";
+    }
+
+    const utf8Match = header.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+    if (utf8Match) {
+      try {
+        return decodeURIComponent(utf8Match[1]);
+      } catch (_error) {
+        return utf8Match[1];
+      }
+    }
+
+    const asciiMatch = header.match(/filename\s*=\s*"?([^\";]+)"?/i);
+    return asciiMatch ? asciiMatch[1] : "";
+  }
+
+  function extractFilenameFromUrl(url) {
+    try {
+      const parsed = new URL(String(url || ""), location.href);
+      const segment = parsed.pathname.split("/").filter(Boolean).pop() || "";
+      return decodeURIComponent(segment);
+    } catch (_error) {
+      return "";
+    }
   }
 
   function extractDownloadLikeStrings(value, results = [], seen = new Set(), depth = 0) {

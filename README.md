@@ -10,7 +10,7 @@ This is an unofficial tool and is not affiliated with OpenAI.
 
 ## What it can do
 
-- Export the current chat as `Markdown + JSON`
+- Export the current chat as a single local package zip with `Markdown + JSON + assets/`
 - Export all visible conversations as a bulk `JSON archive + Markdown index`
 - Export a separate attachment manifest for the current chat
 - Build a bulk attachment index for all exported conversations
@@ -33,8 +33,12 @@ What works today:
 - exported `Markdown` places attachment references directly under the message
   they came from
 - current-chat export writes an extra `attachments.json` manifest
-- current-chat export tries to trigger downloads for direct file/image URLs it
-  can see
+- current-chat export packages downloaded attachment/image binaries into a local
+  zip when ChatGPT still exposes retrievable file URLs
+- packaged current-chat Markdown rewrites attachment links to local relative
+  paths when the files were successfully captured
+- extract the current-chat zip before opening the Markdown file if you want the
+  relative asset links to resolve locally
 - for `file_id` style references, the extension also records fallback download
   candidates from ChatGPT's same-site endpoints
 
@@ -78,10 +82,12 @@ No external server is used.
 
 ### Current chat
 
-- `chatgpt-...md`
-- `chatgpt-...json`
-- `chatgpt-...attachments-...json`
-- attempted direct downloads for visible/downloadable attachments
+- `chatgpt-...zip`
+- zip contents include:
+  - `chatgpt-...md`
+  - `chatgpt-...json`
+  - `chatgpt-...attachments-...json`
+  - `assets/...`
 
 ### All chats
 
@@ -130,6 +136,8 @@ release package for manual installation/testing.
 ## Files
 
 - `manifest.json`: extension manifest
+- `THIRD_PARTY_NOTICES.md`: bundled library notice information
+- `vendor/jszip.min.js`: bundled zip library used for current-chat package export
 - `content.js`: export logic, DOM parsing, floating panel, downloads
 - `page-bridge.js`: same-page bridge for ChatGPT requests
 - `popup.html`: popup UI

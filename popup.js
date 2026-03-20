@@ -32,9 +32,9 @@ async function runAction(action) {
 
     if (action === "export-current") {
       const attachmentPart = response.result.attachmentCount
-        ? ` Attachment refs: ${response.result.attachmentCount}.`
+        ? ` Local attachments: ${response.result.downloadedAttachmentCount || 0}/${response.result.attachmentCount}.`
         : "";
-      setStatus(`Done. Downloaded current chat: ${response.result.title}.${attachmentPart}`);
+      setStatus(`Done. Packaged current chat: ${response.result.title}.${attachmentPart}`);
     } else {
       const attachmentPart = response.result.attachmentCount
         ? ` Attachments indexed: ${response.result.attachmentCount}.`
