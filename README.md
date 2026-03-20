@@ -16,6 +16,8 @@ This is an unofficial tool and is not affiliated with OpenAI.
 - Build a bulk attachment index for all exported conversations
 - Keep attachments attached to their original message positions inside exported
   chat files
+- Preserve visible message hyperlinks as clickable absolute links in exported
+  Markdown when the page DOM exposes them
 - Show a floating export panel directly on ChatGPT pages
 - Provide the same actions from the browser toolbar popup
 - Filter out most internal tool-call traces and reasoning noise from clean

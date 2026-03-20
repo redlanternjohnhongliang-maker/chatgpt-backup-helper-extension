@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Backup Helper",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Export current or bulk ChatGPT conversations with attachment manifests.",
   "permissions": [
     "tabs"

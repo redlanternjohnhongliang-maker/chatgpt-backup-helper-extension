@@ -90,7 +90,7 @@ async function exportCurrentChat() {
     payload = buildDomConversationPayload();
   }
 
-  payload = mergeDomAttachmentsIntoPayload(payload);
+  payload = mergeDomRenderDataIntoPayload(payload);
 
   if (!payload.messages.length) {
     throw new Error("No messages found. Open a conversation first.");
@@ -1153,7 +1153,7 @@ function groupAttachmentsByArticleIndex(attachments) {
   return grouped;
 }
 
-function mergeDomAttachmentsIntoPayload(payload) {
+function mergeDomRenderDataIntoPayload(payload) {
   if (!payload?.messages?.length) {
     return payload;
   }
@@ -1174,12 +1174,15 @@ function mergeDomAttachmentsIntoPayload(payload) {
     }
 
     const domAttachments = attachmentsByArticleIndex.get(entry.articleIndex) || [];
-    if (!domAttachments.length) {
+    const mergedText = choosePreferredExportText(message.text, entry.text);
+
+    if (!domAttachments.length && mergedText === message.text) {
       return message;
     }
 
     return {
       ...message,
+      text: mergedText,
       attachments: normalizeAttachmentList([...(message.attachments || []), ...domAttachments])
     };
   });
@@ -1188,6 +1191,66 @@ function mergeDomAttachmentsIntoPayload(payload) {
     ...payload,
     messages: mergedMessages
   };
+}
+
+function choosePreferredExportText(apiText, domText) {
+  const normalizedApi = normalizeWhitespace(apiText || "");
+  const normalizedDom = normalizeWhitespace(domText || "");
+
+  if (!normalizedDom) {
+    return normalizedApi;
+  }
+
+  if (!normalizedApi) {
+    return normalizedDom;
+  }
+
+  const apiHasLinks = containsExportableLinkText(normalizedApi);
+  const domHasLinks = containsExportableLinkText(normalizedDom);
+
+  if (domHasLinks && !apiHasLinks && areCompatibleMessageTexts(normalizedApi, normalizedDom)) {
+    return normalizedDom;
+  }
+
+  return normalizedApi;
+}
+
+function containsExportableLinkText(text) {
+  return /\[[^\]]+\]\((?:https?:\/\/|mailto:)/i.test(text) || /https?:\/\/\S+/i.test(text);
+}
+
+function areCompatibleMessageTexts(left, right) {
+  const normalizedLeft = normalizeComparableMessageText(left);
+  const normalizedRight = normalizeComparableMessageText(right);
+
+  if (!normalizedLeft || !normalizedRight) {
+    return false;
+  }
+
+  if (normalizedLeft === normalizedRight) {
+    return true;
+  }
+
+  const shorter = normalizedLeft.length <= normalizedRight.length ? normalizedLeft : normalizedRight;
+  const longer = normalizedLeft.length <= normalizedRight.length ? normalizedRight : normalizedLeft;
+
+  if (shorter.length >= 60 && longer.includes(shorter)) {
+    return true;
+  }
+
+  const probeLength = Math.min(120, shorter.length);
+  return probeLength >= 30 && longer.includes(shorter.slice(0, probeLength));
+}
+
+function normalizeComparableMessageText(text) {
+  return normalizeWhitespace(text || "")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1")
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/mailto:\S+/gi, " ")
+    .replace(/[`*_>#]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 }
 
 function findMessageNodes() {
@@ -1267,7 +1330,41 @@ function extractDomMessageText(root) {
     code.replaceWith(replacement);
   });
 
+  clone.querySelectorAll("a[href]").forEach((anchor) => {
+    if (anchor.closest("pre")) {
+      return;
+    }
+
+    const href = normalizeExportHref(anchor.getAttribute("href") || anchor.href || "");
+    const label = normalizeWhitespace(anchor.innerText || anchor.textContent || "");
+
+    if (!href) {
+      return;
+    }
+
+    const replacement = document.createElement("span");
+    replacement.textContent = label ? `[${label}](${href})` : href;
+    anchor.replaceWith(replacement);
+  });
+
   return normalizeWhitespace(clone.innerText || "");
+}
+
+function normalizeExportHref(href) {
+  const value = String(href || "").trim();
+  if (!value) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(value, location.href);
+    if (!["http:", "https:", "mailto:"].includes(parsed.protocol)) {
+      return "";
+    }
+    return parsed.href;
+  } catch (_error) {
+    return "";
+  }
 }
 
 function getLanguageFromCodeBlock(code) {
