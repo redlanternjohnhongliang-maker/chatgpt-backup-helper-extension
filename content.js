@@ -1,0 +1,1061 @@
+"use strict";
+
+const BRIDGE_REQUEST_TYPE = "CHATGPT_BACKUP_BRIDGE_REQUEST";
+const BRIDGE_RESPONSE_TYPE = "CHATGPT_BACKUP_BRIDGE_RESPONSE";
+const TOAST_ID = "chatgpt-backup-extension-toast";
+const PANEL_ID = "chatgpt-backup-extension-panel";
+const pendingBridgeRequests = new Map();
+let bridgeInjected = false;
+let actionInFlight = false;
+
+init();
+
+function init() {
+  injectBridge();
+  injectUiShell();
+  ensureFloatingPanel();
+
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type !== "chatgpt-backup-action") {
+      return false;
+    }
+
+    handleAction(message.action)
+      .then((result) => sendResponse({ ok: true, result }))
+      .catch((error) => sendResponse({ ok: false, error: error.message || String(error) }));
+
+    return true;
+  });
+
+  window.addEventListener("message", handleBridgeResponse);
+  window.addEventListener("load", ensureFloatingPanel);
+
+  const observer = new MutationObserver(() => {
+    ensureFloatingPanel();
+  });
+
+  observer.observe(document.documentElement, {
+    childList: true,
+    subtree: true
+  });
+}
+
+async function handleAction(action) {
+  if (actionInFlight) {
+    throw new Error("Another export is already running. Please wait.");
+  }
+
+  actionInFlight = true;
+  refreshFloatingPanelState();
+
+  try {
+    switch (action) {
+      case "export-current":
+        return await exportCurrentChat();
+      case "export-all":
+        return await exportAllChats();
+      default:
+        throw new Error(`Unsupported action: ${action}`);
+    }
+  } finally {
+    actionInFlight = false;
+    refreshFloatingPanelState();
+  }
+}
+
+async function exportCurrentChat() {
+  showToast("Preparing current chat export...");
+
+  const conversationId = getConversationId();
+  if (!conversationId && isProjectPage()) {
+    throw new Error("Project page detected. Open a specific chat thread for current chat export.");
+  }
+
+  let payload = null;
+
+  if (conversationId) {
+    try {
+      const detail = await bridgeRequest("fetch-conversation-detail", { conversationId });
+      payload = normalizeConversationDetail(detail, {
+        fallbackId: conversationId,
+        fallbackUrl: location.href,
+        fallbackTitle: getConversationTitle()
+      });
+    } catch (_error) {
+      payload = null;
+    }
+  }
+
+  if (!payload) {
+    payload = buildDomConversationPayload();
+  }
+
+  if (!payload.messages.length) {
+    throw new Error("No messages found. Open a conversation first.");
+  }
+
+  downloadText(
+    buildConversationFilename(payload, "md"),
+    buildConversationMarkdown(payload),
+    "text/markdown;charset=utf-8"
+  );
+
+  downloadText(
+    buildConversationFilename(payload, "json"),
+    JSON.stringify(payload, null, 2),
+    "application/json;charset=utf-8"
+  );
+
+  showToast(`Current chat exported: ${payload.title}`);
+
+  return {
+    title: payload.title,
+    conversationId: payload.conversationId,
+    messageCount: payload.messages.length
+  };
+}
+
+async function exportAllChats() {
+  showToast("Loading conversation list...");
+
+  const summaries = await fetchAllConversationSummaries();
+  if (!summaries.length) {
+    throw new Error("No conversations returned by the API.");
+  }
+
+  const exported = [];
+  const failed = [];
+  let completed = 0;
+  const concurrency = 4;
+
+  await runWithConcurrency(summaries, concurrency, async (summary) => {
+    try {
+      const detail = await bridgeRequest("fetch-conversation-detail", {
+        conversationId: summary.id
+      });
+
+      exported.push(
+        normalizeConversationDetail(detail, {
+          fallbackId: summary.id,
+          fallbackUrl: buildConversationUrl(summary.id),
+          fallbackTitle: summary.title
+        })
+      );
+    } catch (error) {
+      failed.push({
+        id: summary.id,
+        title: summary.title || "",
+        error: error.message || String(error)
+      });
+    } finally {
+      completed += 1;
+      showToast(`Exporting ${completed}/${summaries.length} chats...`);
+    }
+  });
+
+  const timestamp = new Date().toISOString();
+  const archive = {
+    exportedAt: timestamp,
+    workspaceUrl: location.origin,
+    totalConversationsFound: summaries.length,
+    exportedCount: exported.length,
+    failedCount: failed.length,
+    failed,
+    conversations: exported
+  };
+
+  const stamp = timestamp.replace(/[:.]/g, "-");
+  downloadText(
+    `chatgpt-all-conversations-${stamp}.json`,
+    JSON.stringify(archive, null, 2),
+    "application/json;charset=utf-8"
+  );
+
+  downloadText(
+    `chatgpt-all-conversations-index-${stamp}.md`,
+    buildArchiveIndexMarkdown(archive),
+    "text/markdown;charset=utf-8"
+  );
+
+  showToast(`Bulk export finished. Exported ${exported.length} chats.`);
+
+  return {
+    exportedCount: exported.length,
+    failedCount: failed.length
+  };
+}
+
+async function runWithConcurrency(items, concurrency, worker) {
+  let index = 0;
+
+  async function runWorker() {
+    while (index < items.length) {
+      const currentIndex = index;
+      index += 1;
+      await worker(items[currentIndex], currentIndex);
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    () => runWorker()
+  );
+
+  await Promise.all(workers);
+}
+
+async function fetchAllConversationSummaries() {
+  const limit = 100;
+  const conversations = [];
+  const seenIds = new Set();
+
+  for (let offset = 0; offset < 10000; offset += limit) {
+    const rawPage = await bridgeRequest("fetch-conversation-list", { offset, limit });
+    const pageItems = normalizeConversationSummaries(rawPage);
+
+    if (!pageItems.length) {
+      break;
+    }
+
+    for (const item of pageItems) {
+      if (!item.id || seenIds.has(item.id)) {
+        continue;
+      }
+
+      seenIds.add(item.id);
+      conversations.push(item);
+    }
+
+    if (pageItems.length < limit) {
+      break;
+    }
+  }
+
+  return conversations;
+}
+
+function normalizeConversationSummaries(raw) {
+  const items = Array.isArray(raw)
+    ? raw
+    : Array.isArray(raw?.items)
+      ? raw.items
+      : Array.isArray(raw?.conversations)
+        ? raw.conversations
+        : Array.isArray(raw?.data)
+          ? raw.data
+          : [];
+
+  return items
+    .map((item) => ({
+      id: item?.id || item?.conversation_id || item?.conversationId || "",
+      title: normalizeWhitespace(item?.title || item?.name || ""),
+      updateTime: item?.update_time || item?.updateTime || item?.updated_at || null,
+      createTime: item?.create_time || item?.createTime || item?.created_at || null
+    }))
+    .filter((item) => item.id);
+}
+
+function normalizeConversationDetail(raw, options = {}) {
+  const conversationId = raw?.conversation_id || raw?.id || options.fallbackId || "unknown";
+  const title = normalizeWhitespace(raw?.title || options.fallbackTitle || `conversation-${conversationId}`);
+  const currentNodeId = raw?.current_node || raw?.currentNode || null;
+  const mapping = raw?.mapping || {};
+  let orderedNodes = [];
+
+  if (currentNodeId && mapping[currentNodeId]) {
+    orderedNodes = buildCurrentPathNodes(mapping, currentNodeId);
+  } else {
+    orderedNodes = Object.values(mapping)
+      .filter((node) => node?.message)
+      .sort((a, b) => {
+        const left = Number(a?.message?.create_time || a?.message?.createTime || 0);
+        const right = Number(b?.message?.create_time || b?.message?.createTime || 0);
+        return left - right;
+      });
+  }
+
+  const rawMessages = orderedNodes
+    .map((node, index) => normalizeMessageNode(node, index))
+    .filter((message) => message && message.text);
+
+  const messages = rawMessages
+    .map((message) => toVisibleExportMessage(message))
+    .filter(Boolean)
+    .map((message, index) => ({
+      ...message,
+      index: index + 1
+    }));
+
+  return {
+    source: "chatgpt-internal-api",
+    exportedAt: new Date().toISOString(),
+    title,
+    url: options.fallbackUrl || buildConversationUrl(conversationId),
+    conversationId,
+    currentNodeId,
+    rawMessageCount: rawMessages.length,
+    messageCount: messages.length,
+    messages,
+    rawMeta: {
+      createTime: raw?.create_time || raw?.createTime || null,
+      updateTime: raw?.update_time || raw?.updateTime || null
+    }
+  };
+}
+
+function buildCurrentPathNodes(mapping, currentNodeId) {
+  const chain = [];
+  const seen = new Set();
+  let pointer = currentNodeId;
+
+  while (pointer && mapping[pointer] && !seen.has(pointer)) {
+    const node = mapping[pointer];
+    seen.add(pointer);
+    if (node?.message) {
+      chain.push(node);
+    }
+    pointer = node?.parent || null;
+  }
+
+  return chain.reverse();
+}
+
+function normalizeMessageNode(node, index) {
+  const message = node?.message;
+  if (!message) {
+    return null;
+  }
+
+  const role = normalizeRole(message?.author?.role || message?.author?.name || "unknown");
+  const text = extractTextFromContent(message?.content);
+
+  return {
+    index: index + 1,
+    id: message?.id || node?.id || "",
+    role,
+    createTime: message?.create_time || message?.createTime || null,
+    text
+  };
+}
+
+function toVisibleExportMessage(message) {
+  const cleanedText = cleanExportMessageText(message.role, message.text);
+  if (!cleanedText) {
+    return null;
+  }
+
+  if (!isVisibleExportMessage(message.role, cleanedText)) {
+    return null;
+  }
+
+  return {
+    ...message,
+    text: cleanedText
+  };
+}
+
+function cleanExportMessageText(role, text) {
+  let cleaned = normalizeWhitespace(text);
+
+  if (role === "user") {
+    cleaned = summarizeUserAttachments(cleaned);
+  }
+
+  return normalizeWhitespace(cleaned);
+}
+
+function summarizeUserAttachments(text) {
+  const lines = normalizeLineEndings(text)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (!lines.some((line) => line === "image_asset_pointer" || line.startsWith("sediment://file_"))) {
+    return text;
+  }
+
+  let attachmentCount = 0;
+  const keptLines = [];
+
+  for (const line of lines) {
+    if (line === "image_asset_pointer") {
+      continue;
+    }
+
+    if (line.startsWith("sediment://file_")) {
+      attachmentCount += 1;
+      continue;
+    }
+
+    keptLines.push(line);
+  }
+
+  if (attachmentCount > 0) {
+    keptLines.unshift(`[${attachmentCount} attachment(s)]`);
+  }
+
+  return keptLines.join("\n");
+}
+
+function isVisibleExportMessage(role, text) {
+  const normalized = normalizeWhitespace(text);
+  if (!normalized) {
+    return false;
+  }
+
+  if (normalized === "model_editable_context") {
+    return false;
+  }
+
+  if (/^thoughts(?:\n|$)/i.test(normalized)) {
+    return false;
+  }
+
+  if (/^Thought for /i.test(normalized)) {
+    return false;
+  }
+
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(normalized)) {
+    return false;
+  }
+
+  if (isToolPayload(normalized)) {
+    return false;
+  }
+
+  return role === "user" || role === "assistant";
+}
+
+function isToolPayload(text) {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    const keys = Object.keys(parsed);
+    const toolKeys = new Set([
+      "search_query",
+      "image_query",
+      "open",
+      "click",
+      "find",
+      "screenshot",
+      "sports",
+      "finance",
+      "weather",
+      "time",
+      "response_length"
+    ]);
+
+    return keys.some((key) => toolKeys.has(key));
+  } catch (_error) {
+    return false;
+  }
+}
+
+function extractTextFromContent(content) {
+  if (!content) {
+    return "";
+  }
+
+  if (typeof content === "string") {
+    return normalizeWhitespace(content);
+  }
+
+  if (Array.isArray(content)) {
+    return normalizeWhitespace(content.map(extractTextFromContent).filter(Boolean).join("\n"));
+  }
+
+  if (Array.isArray(content.parts)) {
+    return normalizeWhitespace(content.parts.map(extractTextFromContent).filter(Boolean).join("\n"));
+  }
+
+  if (typeof content.text === "string") {
+    return normalizeWhitespace(content.text);
+  }
+
+  if (typeof content.result === "string") {
+    return normalizeWhitespace(content.result);
+  }
+
+  if (typeof content.content === "string") {
+    return normalizeWhitespace(content.content);
+  }
+
+  if (typeof content === "object") {
+    const flattened = Object.values(content)
+      .map(extractTextFromContent)
+      .filter(Boolean)
+      .join("\n");
+    return normalizeWhitespace(flattened);
+  }
+
+  return "";
+}
+
+function buildDomConversationPayload() {
+  const messages = extractDomMessages();
+  const title = getConversationTitle();
+  const conversationId = getConversationId() || "current";
+
+  return {
+    source: "dom-fallback",
+    exportedAt: new Date().toISOString(),
+    title,
+    url: location.href,
+    conversationId,
+    messageCount: messages.length,
+    messages
+  };
+}
+
+function extractDomMessages() {
+  const nodes = findMessageNodes();
+  const fingerprints = new Set();
+  const messages = [];
+
+  nodes.forEach((node, index) => {
+    const role = inferRole(node, index);
+    const text = extractDomMessageText(node);
+    const fingerprint = `${role}::${text.slice(0, 300)}`;
+
+    if (!text || fingerprints.has(fingerprint)) {
+      return;
+    }
+
+    fingerprints.add(fingerprint);
+    messages.push({
+      index: messages.length + 1,
+      role,
+      text
+    });
+  });
+
+  return messages;
+}
+
+function findMessageNodes() {
+  const roleNodes = Array.from(document.querySelectorAll("[data-message-author-role]"))
+    .map((node) => node.closest("article") || node);
+  const articles = Array.from(document.querySelectorAll("main article"));
+  const combined = dedupeNodes([...roleNodes, ...articles]).filter(Boolean);
+
+  if (combined.length) {
+    return combined;
+  }
+
+  return Array.from(document.querySelectorAll("main section, main div"))
+    .filter((node) => (node.innerText || "").trim().length > 80)
+    .slice(0, 60);
+}
+
+function inferRole(node, index) {
+  const directRole =
+    node.getAttribute?.("data-message-author-role") ||
+    node.querySelector?.("[data-message-author-role]")?.getAttribute("data-message-author-role");
+
+  if (directRole) {
+    return normalizeRole(directRole);
+  }
+
+  const hint = `${node.getAttribute?.("aria-label") || ""} ${node.innerText || ""}`.toLowerCase();
+
+  if (hint.includes("assistant") || hint.includes("chatgpt")) {
+    return "assistant";
+  }
+  if (hint.includes("user") || hint.includes("you")) {
+    return "user";
+  }
+
+  return index % 2 === 0 ? "user" : "assistant";
+}
+
+function normalizeRole(role) {
+  const lowered = String(role || "").toLowerCase();
+
+  if (lowered.includes("assistant") || lowered.includes("chatgpt")) {
+    return "assistant";
+  }
+  if (lowered.includes("user")) {
+    return "user";
+  }
+  if (lowered.includes("tool")) {
+    return "tool";
+  }
+
+  return lowered || "unknown";
+}
+
+function extractDomMessageText(root) {
+  const clone = root.cloneNode(true);
+
+  clone
+    .querySelectorAll("button, nav, svg, img, form, textarea, input, footer, aside")
+    .forEach((node) => node.remove());
+
+  clone.querySelectorAll("pre").forEach((pre) => {
+    const code = pre.querySelector("code");
+    const language = getLanguageFromCodeBlock(code);
+    const text = normalizeLineEndings(pre.innerText || "");
+    const replacement = document.createElement("div");
+    replacement.textContent = `\n\`\`\`${language}\n${text}\n\`\`\`\n`;
+    pre.replaceWith(replacement);
+  });
+
+  clone.querySelectorAll("code").forEach((code) => {
+    if (code.closest("pre")) {
+      return;
+    }
+    const replacement = document.createElement("span");
+    replacement.textContent = `\`${code.innerText || ""}\``;
+    code.replaceWith(replacement);
+  });
+
+  return normalizeWhitespace(clone.innerText || "");
+}
+
+function getLanguageFromCodeBlock(code) {
+  if (!code) {
+    return "";
+  }
+
+  const className = code.className || "";
+  const match = className.match(/language-([a-z0-9_-]+)/i);
+  return match ? match[1] : "";
+}
+
+function getConversationId() {
+  const match = location.pathname.match(/\/c\/([^/?#]+)/);
+  return match ? match[1] : "";
+}
+
+function isProjectPage() {
+  return /\/project(?:[/?#]|$)/.test(location.pathname);
+}
+
+function getConversationTitle() {
+  const candidates = [
+    document.querySelector("main h1"),
+    document.querySelector("h1"),
+    document.querySelector("main h2"),
+    document.querySelector("header h1")
+  ];
+
+  for (const candidate of candidates) {
+    const text = normalizeWhitespace(candidate?.textContent || "");
+    if (text) {
+      return text;
+    }
+  }
+
+  const fallback = document.title
+    .replace(/\s*-\s*ChatGPT.*$/i, "")
+    .replace(/\s*\|\s*ChatGPT.*$/i, "");
+
+  return normalizeWhitespace(fallback) || "chatgpt-conversation";
+}
+
+function buildConversationUrl(conversationId) {
+  return `${location.origin}/c/${conversationId}`;
+}
+
+function buildConversationFilename(payload, extension) {
+  const title = slugify(payload.title || "chat");
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `chatgpt-${title}-${payload.conversationId}-${stamp}.${extension}`;
+}
+
+function buildConversationMarkdown(payload) {
+  const lines = [
+    `# ${payload.title}`,
+    "",
+    `- Exported at: ${payload.exportedAt}`,
+    `- Source: ${payload.source}`,
+    `- URL: ${payload.url}`,
+    `- Conversation ID: ${payload.conversationId}`,
+    `- Message count: ${payload.messageCount}`,
+    ""
+  ];
+
+  for (const message of payload.messages) {
+    lines.push(`## ${formatRole(message.role)} ${message.index}`);
+    lines.push("");
+    lines.push(message.text || "_empty_");
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
+function buildArchiveIndexMarkdown(archive) {
+  const lines = [
+    "# ChatGPT Bulk Export Index",
+    "",
+    `- Exported at: ${archive.exportedAt}`,
+    `- Workspace URL: ${archive.workspaceUrl}`,
+    `- Conversations exported: ${archive.exportedCount}`,
+    `- Failed: ${archive.failedCount}`,
+    "",
+    "## Conversations",
+    ""
+  ];
+
+  archive.conversations.forEach((conversation, index) => {
+    lines.push(`${index + 1}. ${conversation.title} | ${conversation.conversationId} | ${conversation.messageCount} messages`);
+  });
+
+  if (archive.failed.length) {
+    lines.push("");
+    lines.push("## Failed");
+    lines.push("");
+    archive.failed.forEach((item, index) => {
+      lines.push(`${index + 1}. ${item.title || item.id} | ${item.error}`);
+    });
+  }
+
+  lines.push("");
+  return lines.join("\n");
+}
+
+function formatRole(role) {
+  switch (role) {
+    case "assistant":
+      return "Assistant";
+    case "user":
+      return "User";
+    case "tool":
+      return "Tool";
+    default:
+      return "Unknown";
+  }
+}
+
+function slugify(input) {
+  const slug = String(input || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+
+  return slug || "chat";
+}
+
+function downloadText(filename, content, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function bridgeRequest(action, payload = {}) {
+  injectBridge();
+
+  return new Promise((resolve, reject) => {
+    const requestId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const timeoutId = window.setTimeout(() => {
+      pendingBridgeRequests.delete(requestId);
+      reject(new Error("Bridge request timed out."));
+    }, 30000);
+
+    pendingBridgeRequests.set(requestId, { resolve, reject, timeoutId });
+    window.postMessage({ type: BRIDGE_REQUEST_TYPE, requestId, action, payload }, "*");
+  });
+}
+
+function handleBridgeResponse(event) {
+  if (event.source !== window || !event.data || event.data.type !== BRIDGE_RESPONSE_TYPE) {
+    return;
+  }
+
+  const request = pendingBridgeRequests.get(event.data.requestId);
+  if (!request) {
+    return;
+  }
+
+  pendingBridgeRequests.delete(event.data.requestId);
+  clearTimeout(request.timeoutId);
+
+  if (event.data.ok) {
+    request.resolve(event.data.result);
+  } else {
+    request.reject(new Error(event.data.error || "Bridge request failed."));
+  }
+}
+
+function injectBridge() {
+  if (bridgeInjected) {
+    return;
+  }
+
+  const script = document.createElement("script");
+  script.src = chrome.runtime.getURL("page-bridge.js");
+  script.dataset.chatgptBackupBridge = "true";
+  (document.head || document.documentElement).appendChild(script);
+  script.onload = () => script.remove();
+  bridgeInjected = true;
+}
+
+function injectToastStyles() {
+  if (document.getElementById("chatgpt-backup-extension-style")) {
+    return;
+  }
+
+  const style = document.createElement("style");
+  style.id = "chatgpt-backup-extension-style";
+  style.textContent = `
+    #${PANEL_ID} {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      z-index: 2147483647;
+      width: 188px;
+      border-radius: 16px;
+      background: rgba(15, 23, 42, 0.94);
+      color: #ffffff;
+      box-shadow: 0 14px 40px rgba(0, 0, 0, 0.28);
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      backdrop-filter: blur(8px);
+      font: 12px/1.45 "Segoe UI", Arial, sans-serif;
+      overflow: hidden;
+    }
+    #${PANEL_ID}[data-minimized="true"] .chatgpt-backup-extension-body {
+      display: none;
+    }
+    #${PANEL_ID} .chatgpt-backup-extension-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+    }
+    #${PANEL_ID} .chatgpt-backup-extension-title {
+      font-weight: 600;
+      font-size: 12px;
+    }
+    #${PANEL_ID} .chatgpt-backup-extension-mini {
+      border: 0;
+      background: transparent;
+      color: #cbd5e1;
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
+      padding: 0;
+    }
+    #${PANEL_ID} .chatgpt-backup-extension-body {
+      padding: 10px 12px 12px;
+    }
+    #${PANEL_ID} .chatgpt-backup-extension-desc {
+      margin: 0 0 10px;
+      color: #cbd5e1;
+      font-size: 11px;
+    }
+    #${PANEL_ID} .chatgpt-backup-extension-btn {
+      width: 100%;
+      margin: 0 0 8px;
+      padding: 9px 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      background: rgba(30, 41, 59, 0.92);
+      color: #ffffff;
+      cursor: pointer;
+      font-size: 12px;
+      text-align: left;
+    }
+    #${PANEL_ID} .chatgpt-backup-extension-btn:last-of-type {
+      margin-bottom: 0;
+    }
+    #${PANEL_ID} .chatgpt-backup-extension-btn:hover {
+      background: rgba(51, 65, 85, 0.96);
+    }
+    #${PANEL_ID} .chatgpt-backup-extension-btn:disabled {
+      opacity: 0.6;
+      cursor: wait;
+    }
+    #${TOAST_ID} {
+      position: fixed;
+      right: 16px;
+      bottom: 190px;
+      z-index: 2147483647;
+      max-width: 340px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(15, 23, 42, 0.95);
+      color: #ffffff;
+      font: 12px/1.45 "Segoe UI", Arial, sans-serif;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
+      display: none;
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+function injectUiShell() {
+  injectToastStyles();
+
+  if (!document.getElementById(TOAST_ID) && document.body) {
+    const toast = document.createElement("div");
+    toast.id = TOAST_ID;
+    document.body.appendChild(toast);
+  }
+}
+
+function ensureFloatingPanel() {
+  if (!document.body) {
+    return;
+  }
+
+  if (!document.getElementById(PANEL_ID)) {
+    const panel = document.createElement("div");
+    panel.id = PANEL_ID;
+    panel.dataset.minimized = "false";
+    panel.innerHTML = `
+      <div class="chatgpt-backup-extension-head">
+        <div class="chatgpt-backup-extension-title">Chat Backup</div>
+        <button class="chatgpt-backup-extension-mini" type="button" aria-label="Minimize">-</button>
+      </div>
+      <div class="chatgpt-backup-extension-body">
+        <p class="chatgpt-backup-extension-desc">Business 工作区本地备份</p>
+        <button class="chatgpt-backup-extension-btn" data-action="export-current" type="button">导出当前聊天</button>
+        <button class="chatgpt-backup-extension-btn" data-action="export-all" type="button">导出全部聊天</button>
+      </div>
+    `;
+
+    panel.querySelector("[data-action='export-current']").addEventListener("click", async () => {
+      try {
+        await handleAction("export-current");
+      } catch (error) {
+        showToast(error.message || "Current chat export failed.");
+      }
+    });
+
+    panel.querySelector("[data-action='export-all']").addEventListener("click", async () => {
+      try {
+        await handleAction("export-all");
+      } catch (error) {
+        showToast(error.message || "Bulk export failed.");
+      }
+    });
+
+    panel.querySelector(".chatgpt-backup-extension-mini").addEventListener("click", () => {
+      panel.dataset.minimized = panel.dataset.minimized === "true" ? "false" : "true";
+      panel.querySelector(".chatgpt-backup-extension-mini").textContent =
+        panel.dataset.minimized === "true" ? "+" : "-";
+    });
+
+    document.body.appendChild(panel);
+  }
+
+  refreshFloatingPanelState();
+}
+
+function refreshFloatingPanelState() {
+  const panel = document.getElementById(PANEL_ID);
+  if (!panel) {
+    return;
+  }
+
+  const titleNode = panel.querySelector(".chatgpt-backup-extension-title");
+  if (titleNode) {
+    titleNode.textContent = "Chat Backup";
+  }
+
+  const currentButton = panel.querySelector("[data-action='export-current']");
+  if (currentButton) {
+    currentButton.textContent = "Export current chat";
+    currentButton.disabled = actionInFlight;
+  }
+
+  const allButton = panel.querySelector("[data-action='export-all']");
+  if (allButton) {
+    allButton.textContent = "Export all chats";
+    allButton.disabled = actionInFlight;
+  }
+
+  const description = panel.querySelector(".chatgpt-backup-extension-desc");
+  if (!description) {
+    return;
+  }
+
+  if (actionInFlight) {
+    description.textContent = "Export running. Keep this tab open.";
+  } else if (!getConversationId()) {
+    description.textContent = "Project page detected. Export all works here. Open a thread for current chat export.";
+  } else {
+    description.textContent = "Current thread and full workspace export are available.";
+  }
+}
+
+function updatePanelState() {
+  const panel = document.getElementById(PANEL_ID);
+  if (!panel) {
+    return;
+  }
+
+  panel.querySelectorAll(".chatgpt-backup-extension-btn").forEach((button) => {
+    button.disabled = actionInFlight;
+  });
+
+  const description = panel.querySelector(".chatgpt-backup-extension-desc");
+  if (!description) {
+    return;
+  }
+
+  if (actionInFlight) {
+    description.textContent = "正在导出，请保持此标签页打开";
+  } else if (!getConversationId()) {
+    description.textContent = "当前是项目页，可导出全部；当前聊天需先点进线程";
+  } else {
+    description.textContent = "当前线程和全部聊天都可导出";
+  }
+}
+
+function showToast(message) {
+  const toast = document.getElementById(TOAST_ID);
+  if (!toast) {
+    return;
+  }
+
+  toast.textContent = message;
+  toast.style.display = "block";
+
+  clearTimeout(showToast.timeoutId);
+  showToast.timeoutId = window.setTimeout(() => {
+    toast.style.display = "none";
+  }, 2400);
+}
+
+function dedupeNodes(nodes) {
+  const seen = new Set();
+  const result = [];
+
+  for (const node of nodes) {
+    if (!node || seen.has(node)) {
+      continue;
+    }
+
+    seen.add(node);
+    result.push(node);
+  }
+
+  return result;
+}
+
+function normalizeWhitespace(text) {
+  return normalizeLineEndings(String(text || ""))
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function normalizeLineEndings(text) {
+  return String(text || "").replace(/\r\n/g, "\n");
+}

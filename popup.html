@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ChatGPT Backup Helper</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="popup">
+      <h1>ChatGPT Backup</h1>
+      <p class="subtitle">Export the current chat or the whole workspace from the active ChatGPT tab.</p>
+
+      <button id="export-current" class="primary" type="button">Export Current Chat</button>
+      <button id="export-all" type="button">Export All Chats</button>
+
+      <div id="status" class="status" aria-live="polite">Ready.</div>
+
+      <ul class="notes">
+        <li>Current chat downloads Markdown and JSON.</li>
+        <li>All chats downloads a full JSON archive and an index Markdown file.</li>
+        <li>Keep the tab open while bulk export is running.</li>
+      </ul>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
