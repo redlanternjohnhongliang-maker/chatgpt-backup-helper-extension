@@ -31,9 +31,15 @@ async function runAction(action) {
     }
 
     if (action === "export-current") {
-      setStatus(`Done. Downloaded current chat: ${response.result.title}`);
+      const attachmentPart = response.result.attachmentCount
+        ? ` Attachment refs: ${response.result.attachmentCount}.`
+        : "";
+      setStatus(`Done. Downloaded current chat: ${response.result.title}.${attachmentPart}`);
     } else {
-      setStatus(`Done. Exported ${response.result.exportedCount} chats.${response.result.failedCount ? ` Failed: ${response.result.failedCount}.` : ""}`);
+      const attachmentPart = response.result.attachmentCount
+        ? ` Attachments indexed: ${response.result.attachmentCount}.`
+        : "";
+      setStatus(`Done. Exported ${response.result.exportedCount} chats.${response.result.failedCount ? ` Failed: ${response.result.failedCount}.` : ""}${attachmentPart}`);
     }
   } catch (error) {
     setStatus(error.message || "Unexpected error.");

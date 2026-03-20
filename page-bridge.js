@@ -34,6 +34,8 @@
         return fetchConversationList(payload);
       case "fetch-conversation-detail":
         return fetchConversationDetail(payload);
+      case "resolve-file-download-urls":
+        return resolveFileDownloadUrls(payload);
       default:
         throw new Error(`Unsupported action: ${action}`);
     }
@@ -79,18 +81,11 @@
   }
 
   async function fetchJson(url) {
-    let response = await fetch(url, {
-      credentials: "include",
-      headers: await buildHeaders()
+    const response = await fetchWithAuth(url, {
+      headers: {
+        Accept: "application/json"
+      }
     });
-
-    if (response.status === 401 || response.status === 403) {
-      cachedAccessToken = null;
-      response = await fetch(url, {
-        credentials: "include",
-        headers: await buildHeaders()
-      });
-    }
 
     if (!response.ok) {
       throw new Error(`Request failed: ${response.status} ${response.statusText}`);
@@ -99,10 +94,142 @@
     return response.json();
   }
 
-  async function buildHeaders() {
-    const headers = {
-      Accept: "application/json"
+  async function resolveFileDownloadUrls(payload) {
+    const fileIds = Array.from(
+      new Set(
+        (payload?.fileIds || [])
+          .map((fileId) => String(fileId || "").trim())
+          .filter(Boolean)
+      )
+    ).slice(0, 64);
+
+    const results = {};
+    for (const fileId of fileIds) {
+      results[fileId] = await resolveSingleFileDownloadUrl(fileId);
+    }
+
+    return results;
+  }
+
+  async function resolveSingleFileDownloadUrl(fileId) {
+    const encoded = encodeURIComponent(fileId);
+    const metadataUrl = `${location.origin}/backend-api/files/${encoded}`;
+    const fallbackCandidates = [
+      `${location.origin}/backend-api/files/${encoded}/download`,
+      `${location.origin}/backend-api/files/${encoded}?download=true`
+    ];
+
+    try {
+      const metadata = await fetchJson(metadataUrl);
+      const extractedUrls = extractDownloadLikeStrings(metadata);
+      const candidates = uniqueStrings([...extractedUrls, ...fallbackCandidates]);
+      if (candidates.length) {
+        return {
+          fileId,
+          url: candidates[0],
+          candidates,
+          source: "metadata"
+        };
+      }
+    } catch (_error) {
+      // Fall through to direct endpoint probing.
+    }
+
+    try {
+      const response = await fetchWithAuth(fallbackCandidates[0], {
+        method: "HEAD",
+        headers: {
+          Accept: "*/*"
+        }
+      });
+
+      if (response.ok) {
+        return {
+          fileId,
+          url: fallbackCandidates[0],
+          candidates: fallbackCandidates,
+          source: "head-probe"
+        };
+      }
+    } catch (_error) {
+      // Keep best-effort fallback candidates below.
+    }
+
+    return {
+      fileId,
+      url: "",
+      candidates: fallbackCandidates,
+      source: "fallback"
     };
+  }
+
+  function extractDownloadLikeStrings(value, results = [], seen = new Set(), depth = 0) {
+    if (value == null || depth > 8) {
+      return results;
+    }
+
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (/^https?:\/\//i.test(trimmed) || /^blob:/i.test(trimmed) || /^data:/i.test(trimmed)) {
+        if (!seen.has(trimmed)) {
+          seen.add(trimmed);
+          results.push(trimmed);
+        }
+      }
+      return results;
+    }
+
+    if (Array.isArray(value)) {
+      value.forEach((item) => extractDownloadLikeStrings(item, results, seen, depth + 1));
+      return results;
+    }
+
+    if (typeof value !== "object") {
+      return results;
+    }
+
+    Object.values(value).forEach((child) => {
+      extractDownloadLikeStrings(child, results, seen, depth + 1);
+    });
+
+    return results;
+  }
+
+  function uniqueStrings(values) {
+    return Array.from(
+      new Set(
+        (values || [])
+          .map((value) => String(value || "").trim())
+          .filter(Boolean)
+      )
+    );
+  }
+
+  async function fetchWithAuth(url, init = {}) {
+    let response = await fetch(url, {
+      credentials: "include",
+      ...init,
+      headers: await buildHeaders(init.headers || {})
+    });
+
+    if (response.status === 401 || response.status === 403) {
+      cachedAccessToken = null;
+      response = await fetch(url, {
+        credentials: "include",
+        ...init,
+        headers: await buildHeaders(init.headers || {})
+      });
+    }
+
+    return response;
+  }
+
+  async function buildHeaders(extraHeaders = {}) {
+    const headers = { ...extraHeaders };
+
+    if (!Object.keys(headers).some((key) => key.toLowerCase() === "accept")) {
+      headers.Accept = "application/json";
+    }
 
     const token = await getAccessToken();
     if (token) {

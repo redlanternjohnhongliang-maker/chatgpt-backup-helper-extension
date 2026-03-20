@@ -1,80 +1,108 @@
 # ChatGPT Backup Helper
 
-Chrome extension for exporting ChatGPT conversations from a signed-in browser
-session.
+Chrome extension for exporting ChatGPT conversations from the browser you are
+already signed into.
 
-This project was built for one practical use case:
+This project is aimed at one practical problem: keeping your own local backups
+when important chats live inside a shared `Business / Team` workspace.
 
-- keep local backups of important chats
-- especially useful when using a shared `Business / Team` workspace
-- export both the current thread and the full visible conversation history
+This is an unofficial tool and is not affiliated with OpenAI.
 
-This is an unofficial tool. It is not affiliated with OpenAI.
+## What it can do
 
-## Features
+- Export the current chat as `Markdown + JSON`
+- Export all visible conversations as a bulk `JSON archive + Markdown index`
+- Export a separate attachment manifest for the current chat
+- Build a bulk attachment index for all exported conversations
+- Keep attachments attached to their original message positions inside exported
+  chat files
+- Show a floating export panel directly on ChatGPT pages
+- Provide the same actions from the browser toolbar popup
+- Filter out most internal tool-call traces and reasoning noise from clean
+  exports
 
-- Export current chat to `Markdown + JSON`
-- Export all chats to `JSON archive + Markdown index`
-- Floating in-page backup panel on ChatGPT pages
-- Popup action for quick access from the browser toolbar
-- Current-chat API export with DOM fallback when needed
-- Filters out most internal tool calls and reasoning traces from clean exports
+## Attachment handling
+
+Attachment export is best effort.
+
+What works today:
+
+- attachment metadata is stored inside each message in exported `JSON`
+- exported `Markdown` places attachment references directly under the message
+  they came from
+- current-chat export writes an extra `attachments.json` manifest
+- current-chat export tries to trigger downloads for direct file/image URLs it
+  can see
+- for `file_id` style references, the extension also records fallback download
+  candidates from ChatGPT's same-site endpoints
+
+What is still limited:
+
+- some ChatGPT uploads only expose opaque pointers such as `sediment://file_...`
+- signed URLs may expire
+- bulk export indexes attachment metadata, but it does not mass-download every
+  binary asset for every chat
+- if ChatGPT changes its internal data model or file endpoints, attachment
+  resolution may need an update
 
 ## Why this exists
 
-OpenAI's Help Center currently states:
+OpenAI's Help Center currently says:
 
 - personal ChatGPT workspaces can export data from `Settings > Data Controls`
-- ChatGPT Business workspaces do not support export
-- if personal data is merged into a Business workspace and access is later lost,
-  the migrated data is lost with that workspace
+- ChatGPT Business workspaces do not support the same export flow
+- migrated data can become inaccessible if workspace access is later lost
 
-That makes local browser-side backup useful for users working inside a shared
-workspace.
+That makes browser-side local backup useful for people working inside shared
+workspaces.
 
-References:
+Reference articles:
 
 - https://help.openai.com/en/articles/7260999-how-do-i-export-my-chatgpt-history-and-data
 - https://help.openai.com/en/articles/8801890-can-i-migrate-or-merge-my-chatgpt-free-or-plus-workspace-over-to-my-chatgpt-team-workspace
 
 ## How it works
 
-The extension runs entirely in the browser:
-
-1. `popup.js` sends commands to the active ChatGPT tab
-2. `content.js` manages export flow, UI, and downloads
-3. `page-bridge.js` is injected into the page and uses the current logged-in
+1. `popup.js` sends an export command to the active ChatGPT tab
+2. `content.js` manages UI, export flow, DOM fallback, and downloads
+3. `page-bridge.js` runs in the page context and uses the current signed-in
    same-site session to request conversation data from ChatGPT page endpoints
-4. when a current-thread API fetch fails, the extension falls back to DOM-based
-   extraction
+4. when current-thread API fetching is unavailable, the extension falls back to
+   DOM extraction
 
-No separate server is used.
+No external server is used.
 
-## What gets exported
+## Export outputs
 
 ### Current chat
 
-- one `Markdown` file for readability
-- one `JSON` file for structured backup
+- `chatgpt-...md`
+- `chatgpt-...json`
+- `chatgpt-...attachments-...json`
+- attempted direct downloads for visible/downloadable attachments
 
 ### All chats
 
-- one full `JSON` archive
-- one `Markdown` index file with conversation list
+- `chatgpt-all-conversations-...json`
+- `chatgpt-all-conversations-index-...md`
+- `chatgpt-all-conversations-attachments-...json`
 
-## Current limitations
+## Project-page behavior
 
-- this is not an official OpenAI export API
-- it depends on ChatGPT's current page structure and internal same-site
-  endpoints
-- uploaded attachments are not fully downloaded as binary files yet
-- if ChatGPT changes its internal page data model, some extraction logic may
-  need updating
-- keep the ChatGPT tab open while bulk export is running
+If you are on a project landing page such as:
+
+```text
+https://chatgpt.com/g/.../project
+```
+
+then:
+
+- `Export all chats` can still run
+- `Export current chat` requires opening a specific thread first
 
 ## Install
 
-1. Open `chrome://extensions` in Chrome or Edge
+1. Open `chrome://extensions`
 2. Turn on `Developer mode`
 3. Click `Load unpacked`
 4. Select this folder:
@@ -85,60 +113,27 @@ g:\lianghua\tools\chatgpt_backup_extension
 
 5. Reload your ChatGPT tab
 
-## Usage
-
-### Option 1: floating panel
-
-On ChatGPT pages, the extension shows a floating panel in the bottom-right
-corner:
-
-- `Export current chat`
-- `Export all chats`
-
-### Option 2: browser toolbar popup
-
-Click the extension icon and use the popup buttons:
-
-- `Export Current Chat`
-- `Export All Chats`
-
-## Project-page behavior
-
-If you are on a project page like:
-
-```text
-https://chatgpt.com/g/.../project
-```
-
-then:
-
-- `Export all chats` can still work
-- `Export current chat` requires opening a specific thread first
-
-## File structure
-
-- `manifest.json`: extension manifest
-- `popup.html`: popup UI
-- `popup.css`: popup styles
-- `popup.js`: popup action logic
-- `content.js`: main export logic, in-page floating panel, downloads
-- `page-bridge.js`: same-page bridge for conversation fetches
-
 ## Privacy model
 
 - runs locally in your browser
-- does not upload chat data to a separate server
-- reads content only on `chatgpt.com` and `chat.openai.com`
-- generated export files are downloaded directly by the browser
+- does not upload your chat data to a separate server
+- only requests access to `chatgpt.com` and `chat.openai.com`
+- exported files are downloaded directly by the browser
 
-## Roadmap
+## Packaging
 
-- attachment/image binary download
-- optional raw export mode
-- optional zip packaging
-- Chrome Web Store packaging polish
+This repository can be loaded unpacked for development, or zipped and used as a
+release package for manual installation/testing.
 
-## Disclaimer
+## Files
 
-This tool is provided as-is for local backup convenience. Use it only on
-accounts and workspaces you are authorized to access.
+- `manifest.json`: extension manifest
+- `content.js`: export logic, DOM parsing, floating panel, downloads
+- `page-bridge.js`: same-page bridge for ChatGPT requests
+- `popup.html`: popup UI
+- `popup.css`: popup styles
+- `popup.js`: popup actions and status text
+
+## License
+
+MIT

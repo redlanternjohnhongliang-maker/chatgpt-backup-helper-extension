@@ -90,6 +90,8 @@ async function exportCurrentChat() {
     payload = buildDomConversationPayload();
   }
 
+  payload = mergeDomAttachmentsIntoPayload(payload);
+
   if (!payload.messages.length) {
     throw new Error("No messages found. Open a conversation first.");
   }
@@ -106,12 +108,19 @@ async function exportCurrentChat() {
     "application/json;charset=utf-8"
   );
 
-  showToast(`Current chat exported: ${payload.title}`);
+  const attachmentSummary = await exportCurrentChatAttachments(payload);
+  if (attachmentSummary.totalCount > 0) {
+    showToast(`Current chat exported with ${attachmentSummary.totalCount} attachment reference(s).`);
+  } else {
+    showToast(`Current chat exported: ${payload.title}`);
+  }
 
   return {
     title: payload.title,
     conversationId: payload.conversationId,
-    messageCount: payload.messages.length
+    messageCount: payload.messages.length,
+    attachmentCount: attachmentSummary.totalCount,
+    downloadableAttachmentCount: attachmentSummary.downloadableCount
   };
 }
 
@@ -163,6 +172,7 @@ async function exportAllChats() {
     failed,
     conversations: exported
   };
+  const attachmentArchive = buildBulkAttachmentArchive(exported, timestamp);
 
   const stamp = timestamp.replace(/[:.]/g, "-");
   downloadText(
@@ -177,11 +187,24 @@ async function exportAllChats() {
     "text/markdown;charset=utf-8"
   );
 
-  showToast(`Bulk export finished. Exported ${exported.length} chats.`);
+  if (attachmentArchive.totalAttachments > 0) {
+    downloadText(
+      `chatgpt-all-conversations-attachments-${stamp}.json`,
+      JSON.stringify(attachmentArchive, null, 2),
+      "application/json;charset=utf-8"
+    );
+  }
+
+  showToast(
+    attachmentArchive.totalAttachments > 0
+      ? `Bulk export finished. Exported ${exported.length} chats and indexed ${attachmentArchive.totalAttachments} attachment reference(s).`
+      : `Bulk export finished. Exported ${exported.length} chats.`
+  );
 
   return {
     exportedCount: exported.length,
-    failedCount: failed.length
+    failedCount: failed.length,
+    attachmentCount: attachmentArchive.totalAttachments
   };
 }
 
@@ -328,13 +351,15 @@ function normalizeMessageNode(node, index) {
 
   const role = normalizeRole(message?.author?.role || message?.author?.name || "unknown");
   const text = extractTextFromContent(message?.content);
+  const attachments = extractAttachmentsFromMessage(message);
 
   return {
     index: index + 1,
     id: message?.id || node?.id || "",
     role,
     createTime: message?.create_time || message?.createTime || null,
-    text
+    text,
+    attachments
   };
 }
 
@@ -350,7 +375,8 @@ function toVisibleExportMessage(message) {
 
   return {
     ...message,
-    text: cleanedText
+    text: cleanedText,
+    attachments: normalizeAttachmentList(message.attachments || [])
   };
 }
 
@@ -455,6 +481,562 @@ function isToolPayload(text) {
   }
 }
 
+function extractAttachmentsFromMessage(message) {
+  const results = [];
+  const seen = new Set();
+  const roots = [
+    { value: message?.content, path: ["content"] },
+    { value: message?.metadata, path: ["metadata"] },
+    { value: message?.attachments, path: ["attachments"] }
+  ];
+
+  roots.forEach((root) => {
+    collectAttachmentCandidates(root.value, root.path, results, seen, 0);
+  });
+
+  return normalizeAttachmentList(results);
+}
+
+function collectAttachmentCandidates(value, path, results, seen, depth) {
+  if (value == null || depth > 8) {
+    return;
+  }
+
+  if (typeof value === "string") {
+    const fromString = buildAttachmentFromString(value, path);
+    if (fromString) {
+      pushAttachmentCandidate(fromString, results, seen);
+    }
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => {
+      collectAttachmentCandidates(item, [...path, String(index)], results, seen, depth + 1);
+    });
+    return;
+  }
+
+  if (typeof value !== "object") {
+    return;
+  }
+
+  const fromObject = buildAttachmentFromObject(value, path);
+  if (fromObject) {
+    pushAttachmentCandidate(fromObject, results, seen);
+  }
+
+  Object.entries(value).forEach(([key, child]) => {
+    collectAttachmentCandidates(child, [...path, key], results, seen, depth + 1);
+  });
+}
+
+function buildAttachmentFromObject(objectValue, path) {
+  const pointer =
+    stringOrEmpty(objectValue.asset_pointer) ||
+    stringOrEmpty(objectValue.assetPointer) ||
+    stringOrEmpty(objectValue.file_pointer) ||
+    stringOrEmpty(objectValue.filePointer);
+
+  const downloadUrl =
+    firstDownloadLikeString([
+      objectValue.download_url,
+      objectValue.downloadUrl,
+      objectValue.url,
+      objectValue.href,
+      objectValue.link
+    ]) || "";
+
+  const fileId =
+    stringOrEmpty(objectValue.file_id) ||
+    stringOrEmpty(objectValue.fileId) ||
+    extractFileIdFromPointer(pointer) ||
+    extractFileIdFromDownloadUrl(downloadUrl);
+
+  const name =
+    stringOrEmpty(objectValue.file_name) ||
+    stringOrEmpty(objectValue.filename) ||
+    stringOrEmpty(objectValue.name) ||
+    stringOrEmpty(objectValue.title) ||
+    "";
+
+  const mimeType =
+    stringOrEmpty(objectValue.mime_type) ||
+    stringOrEmpty(objectValue.mimeType) ||
+    "";
+
+  const sizeBytes = toFiniteNumber(objectValue.size_bytes ?? objectValue.sizeBytes ?? objectValue.size);
+  const looksLikeAttachment =
+    Boolean(pointer || downloadUrl || fileId) ||
+    path.some((segment) => /attachment|asset|file|upload|image/i.test(segment));
+
+  if (!looksLikeAttachment) {
+    return null;
+  }
+
+  return {
+    source: "api",
+    sourcePath: path.join("."),
+    pointer,
+    downloadUrl,
+    fileId,
+    name,
+    mimeType,
+    sizeBytes
+  };
+}
+
+function buildAttachmentFromString(stringValue, path) {
+  const trimmed = String(stringValue || "").trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const looksRelevant = path.some((segment) => /attachment|asset|file|upload|image|url|href|link/i.test(segment));
+  const isPointer =
+    trimmed.startsWith("sediment://file_") ||
+    trimmed.startsWith("file-service://") ||
+    trimmed.startsWith("file://");
+  const isDownloadLike =
+    /^https?:\/\//i.test(trimmed) ||
+    /^blob:/i.test(trimmed) ||
+    /^data:/i.test(trimmed);
+
+  if (!isPointer && !isDownloadLike && !looksRelevant) {
+    return null;
+  }
+
+  if (!isPointer && !isDownloadLike) {
+    return null;
+  }
+
+  return {
+    source: "api",
+    sourcePath: path.join("."),
+    pointer: isPointer ? trimmed : "",
+    downloadUrl: isDownloadLike ? trimmed : "",
+    fileId: extractFileIdFromPointer(trimmed) || extractFileIdFromDownloadUrl(trimmed),
+    name: "",
+    mimeType: ""
+  };
+}
+
+function normalizeAttachmentList(attachments) {
+  const seen = new Set();
+  const results = [];
+
+  for (const attachment of attachments || []) {
+    if (!attachment) {
+      continue;
+    }
+
+    const normalized = {
+      source: attachment.source || "unknown",
+      sourcePath: attachment.sourcePath || "",
+      pointer: stringOrEmpty(attachment.pointer),
+      fileId: stringOrEmpty(attachment.fileId) || extractFileIdFromPointer(attachment.pointer) || extractFileIdFromDownloadUrl(attachment.downloadUrl),
+      name: stringOrEmpty(attachment.name),
+      mimeType: stringOrEmpty(attachment.mimeType),
+      sizeBytes: toFiniteNumber(attachment.sizeBytes)
+    };
+
+    normalized.downloadUrl = firstDownloadLikeString([attachment.downloadUrl]) || "";
+    normalized.downloadCandidates = uniqueDownloadCandidates([
+      ...(Array.isArray(attachment.downloadCandidates) ? attachment.downloadCandidates : []),
+      normalized.downloadUrl,
+      ...buildFallbackAttachmentDownloadCandidates(normalized.fileId)
+    ]);
+
+    if (!normalized.pointer && !normalized.downloadUrl && !normalized.fileId) {
+      continue;
+    }
+
+    if (!normalized.name) {
+      normalized.name = buildAttachmentName(normalized);
+    }
+
+    const fingerprint = [
+      normalized.pointer,
+      normalized.downloadUrl,
+      normalized.fileId,
+      normalized.name
+    ].join("|");
+
+    if (seen.has(fingerprint)) {
+      continue;
+    }
+
+    seen.add(fingerprint);
+    results.push(normalized);
+  }
+
+  return results;
+}
+
+function pushAttachmentCandidate(candidate, results, seen) {
+  const normalizedList = normalizeAttachmentList([candidate]);
+  normalizedList.forEach((normalized) => {
+    const fingerprint = [
+      normalized.pointer,
+      normalized.downloadUrl,
+      normalized.fileId,
+      normalized.name
+    ].join("|");
+
+    if (seen.has(fingerprint)) {
+      return;
+    }
+
+    seen.add(fingerprint);
+    results.push(normalized);
+  });
+}
+
+async function exportCurrentChatAttachments(payload) {
+  const fromMessages = (payload.messages || []).flatMap((message) => {
+    const attachments = normalizeAttachmentList(message.attachments || []);
+    return attachments.map((attachment) => ({
+      ...attachment,
+      messageIndex: message.index,
+      role: message.role
+    }));
+  });
+
+  const fromDom = collectDomAttachments();
+  const attachments = await enrichAttachmentsWithDownloadCandidates(
+    normalizeAttachmentList([...fromMessages, ...fromDom])
+  );
+  const downloadable = attachments.filter((attachment) => isDownloadableAttachment(attachment));
+
+  if (!attachments.length) {
+    return {
+      totalCount: 0,
+      downloadableCount: 0
+    };
+  }
+
+  const manifest = {
+    exportedAt: new Date().toISOString(),
+    conversationId: payload.conversationId,
+    conversationTitle: payload.title,
+    totalAttachments: attachments.length,
+    downloadableCount: downloadable.length,
+    attachments
+  };
+
+  downloadText(
+    buildConversationExtraFilename(payload, "attachments", "json"),
+    JSON.stringify(manifest, null, 2),
+    "application/json;charset=utf-8"
+  );
+
+  downloadable.forEach((attachment, index) => {
+    triggerAttachmentDownload(attachment, index);
+  });
+
+  return {
+    totalCount: attachments.length,
+    downloadableCount: downloadable.length
+  };
+}
+
+function buildBulkAttachmentArchive(conversations, exportedAt) {
+  const attachments = [];
+
+  (conversations || []).forEach((conversation) => {
+    (conversation.messages || []).forEach((message) => {
+      normalizeAttachmentList(message.attachments || []).forEach((attachment) => {
+        attachments.push({
+          conversationId: conversation.conversationId,
+          conversationTitle: conversation.title,
+          messageIndex: message.index,
+          role: message.role,
+          ...attachment
+        });
+      });
+    });
+  });
+
+  return {
+    exportedAt,
+    workspaceUrl: location.origin,
+    totalConversations: (conversations || []).length,
+    totalAttachments: attachments.length,
+    downloadableCount: attachments.filter((attachment) => isDownloadableAttachment(attachment)).length,
+    attachments
+  };
+}
+
+async function enrichAttachmentsWithDownloadCandidates(attachments) {
+  const normalized = normalizeAttachmentList(attachments);
+  const unresolvedFileIds = Array.from(
+    new Set(
+      normalized
+        .filter((attachment) => attachment.fileId && !attachment.downloadUrl)
+        .map((attachment) => attachment.fileId)
+    )
+  );
+
+  let resolvedByFileId = {};
+  if (unresolvedFileIds.length) {
+    try {
+      resolvedByFileId = await bridgeRequest("resolve-file-download-urls", {
+        fileIds: unresolvedFileIds
+      });
+    } catch (_error) {
+      resolvedByFileId = {};
+    }
+  }
+
+  return normalizeAttachmentList(
+    normalized.map((attachment) => {
+      const resolved = attachment.fileId ? resolvedByFileId?.[attachment.fileId] : null;
+      return {
+        ...attachment,
+        downloadCandidates: [
+          ...(attachment.downloadCandidates || []),
+          ...(Array.isArray(resolved?.candidates) ? resolved.candidates : []),
+          resolved?.url || ""
+        ]
+      };
+    })
+  );
+}
+
+function collectDomAttachments(nodes = Array.from(document.querySelectorAll("main article"))) {
+  const results = [];
+  const seen = new Set();
+  const articles = Array.from(nodes || []);
+
+  articles.forEach((article, articleIndex) => {
+    article.querySelectorAll("img").forEach((image, imageIndex) => {
+      const src = image.currentSrc || image.src || "";
+      const looksDownloadable = /^https?:\/\//i.test(src) || /^blob:/i.test(src) || /^data:/i.test(src);
+      const largeEnough =
+        Number(image.naturalWidth || image.width || 0) >= 96 ||
+        Number(image.naturalHeight || image.height || 0) >= 96;
+
+      if (!looksDownloadable || !largeEnough) {
+        return;
+      }
+
+      const candidate = normalizeAttachmentList([
+        {
+          source: "dom",
+          sourcePath: `article.${articleIndex}.img.${imageIndex}`,
+          downloadUrl: src,
+          name: image.getAttribute("alt") || ""
+        }
+      ])[0];
+
+      if (!candidate) {
+        return;
+      }
+
+      const fingerprint = `${candidate.downloadUrl}|${candidate.name}`;
+      if (seen.has(fingerprint)) {
+        return;
+      }
+
+      seen.add(fingerprint);
+      results.push({
+        ...candidate,
+        articleIndex
+      });
+    });
+
+    article.querySelectorAll("a[href]").forEach((anchor, anchorIndex) => {
+      const href = anchor.href || "";
+      const likelyFile =
+        /files\.oaiusercontent\.com/i.test(href) ||
+        /\/backend-api\/files\//i.test(href) ||
+        /\.(png|jpg|jpeg|gif|webp|pdf|txt|csv|json|zip|docx?|xlsx?|pptx?)($|\?)/i.test(href) ||
+        anchor.hasAttribute("download");
+
+      if (!likelyFile) {
+        return;
+      }
+
+      const candidate = normalizeAttachmentList([
+        {
+          source: "dom",
+          sourcePath: `article.${articleIndex}.a.${anchorIndex}`,
+          downloadUrl: href,
+          name: anchor.getAttribute("download") || anchor.textContent || ""
+        }
+      ])[0];
+
+      if (!candidate) {
+        return;
+      }
+
+      const fingerprint = `${candidate.downloadUrl}|${candidate.name}`;
+      if (seen.has(fingerprint)) {
+        return;
+      }
+
+      seen.add(fingerprint);
+      results.push({
+        ...candidate,
+        articleIndex
+      });
+    });
+  });
+
+  return results;
+}
+
+function isDownloadableAttachment(attachment) {
+  const url = getPreferredAttachmentDownloadUrl(attachment);
+  return /^https?:\/\//i.test(url) || /^blob:/i.test(url) || /^data:/i.test(url);
+}
+
+function triggerAttachmentDownload(attachment, index) {
+  const href = getPreferredAttachmentDownloadUrl(attachment);
+  if (!href) {
+    return;
+  }
+
+  const filename = buildAttachmentName(attachment, index + 1);
+
+  window.setTimeout(() => {
+    const anchor = document.createElement("a");
+    anchor.href = href;
+    anchor.download = filename;
+    anchor.rel = "noopener";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  }, index * 250);
+}
+
+function buildAttachmentName(attachment, fallbackIndex = 1) {
+  const explicitName = sanitizeFileName(attachment?.name || "");
+  if (explicitName) {
+    return explicitName;
+  }
+
+  const fromUrl = extractFilenameFromUrl(attachment?.downloadUrl || "");
+  if (fromUrl) {
+    return sanitizeFileName(fromUrl);
+  }
+
+  const fileId = stringOrEmpty(attachment?.fileId || extractFileIdFromPointer(attachment?.pointer || ""));
+  if (fileId) {
+    return `attachment-${fileId}`;
+  }
+
+  return `attachment-${fallbackIndex}`;
+}
+
+function getPreferredAttachmentDownloadUrl(attachment) {
+  return firstDownloadLikeString([
+    attachment?.downloadUrl,
+    ...(Array.isArray(attachment?.downloadCandidates) ? attachment.downloadCandidates : [])
+  ]);
+}
+
+function buildConversationExtraFilename(payload, label, extension) {
+  const title = slugify(payload.title || "chat");
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `chatgpt-${title}-${payload.conversationId}-${label}-${stamp}.${extension}`;
+}
+
+function extractFilenameFromUrl(url) {
+  if (!url) {
+    return "";
+  }
+
+  try {
+    if (/^data:/i.test(url) || /^blob:/i.test(url)) {
+      return "";
+    }
+
+    const parsed = new URL(url, location.origin);
+    const pathname = parsed.pathname || "";
+    const lastSegment = pathname.split("/").filter(Boolean).pop() || "";
+    return decodeURIComponent(lastSegment);
+  } catch (_error) {
+    return "";
+  }
+}
+
+function extractFileIdFromPointer(pointer) {
+  const match = String(pointer || "").match(/file[_-][A-Za-z0-9_-]+/);
+  return match ? match[0] : "";
+}
+
+function extractFileIdFromDownloadUrl(url) {
+  const match = String(url || "").match(/file[-_][A-Za-z0-9_-]+/i);
+  return match ? match[0] : "";
+}
+
+function buildFallbackAttachmentDownloadCandidates(fileId) {
+  const normalizedFileId = stringOrEmpty(fileId);
+  if (!normalizedFileId) {
+    return [];
+  }
+
+  const encoded = encodeURIComponent(normalizedFileId);
+  return [
+    `${location.origin}/backend-api/files/${encoded}/download`,
+    `${location.origin}/backend-api/files/${encoded}?download=true`
+  ];
+}
+
+function uniqueDownloadCandidates(values) {
+  const results = [];
+  const seen = new Set();
+
+  for (const value of values || []) {
+    const candidate = String(value || "").trim();
+    if (!candidate) {
+      continue;
+    }
+
+    if (!/^https?:\/\//i.test(candidate) && !/^blob:/i.test(candidate) && !/^data:/i.test(candidate)) {
+      continue;
+    }
+
+    if (seen.has(candidate)) {
+      continue;
+    }
+
+    seen.add(candidate);
+    results.push(candidate);
+  }
+
+  return results;
+}
+
+function firstDownloadLikeString(values) {
+  for (const value of values || []) {
+    const candidate = String(value || "").trim();
+    if (/^https?:\/\//i.test(candidate) || /^blob:/i.test(candidate) || /^data:/i.test(candidate)) {
+      return candidate;
+    }
+  }
+
+  return "";
+}
+
+function stringOrEmpty(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function toFiniteNumber(value) {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : null;
+}
+
+function sanitizeFileName(value) {
+  return String(value || "")
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
+}
+
 function extractTextFromContent(content) {
   if (!content) {
     return "";
@@ -496,7 +1078,16 @@ function extractTextFromContent(content) {
 }
 
 function buildDomConversationPayload() {
-  const messages = extractDomMessages();
+  const entries = extractDomMessageEntries();
+  const attachmentsByArticleIndex = groupAttachmentsByArticleIndex(
+    collectDomAttachments(entries.map((entry) => entry.node))
+  );
+  const messages = entries.map((entry, index) => ({
+    index: index + 1,
+    role: entry.role,
+    text: entry.text,
+    attachments: normalizeAttachmentList(attachmentsByArticleIndex.get(entry.articleIndex) || [])
+  }));
   const title = getConversationTitle();
   const conversationId = getConversationId() || "current";
 
@@ -512,6 +1103,15 @@ function buildDomConversationPayload() {
 }
 
 function extractDomMessages() {
+  return extractDomMessageEntries().map((entry, index) => ({
+    index: index + 1,
+    role: entry.role,
+    text: entry.text,
+    attachments: []
+  }));
+}
+
+function extractDomMessageEntries() {
   const nodes = findMessageNodes();
   const fingerprints = new Set();
   const messages = [];
@@ -527,13 +1127,67 @@ function extractDomMessages() {
 
     fingerprints.add(fingerprint);
     messages.push({
-      index: messages.length + 1,
       role,
-      text
+      text,
+      articleIndex: index,
+      node
     });
   });
 
   return messages;
+}
+
+function groupAttachmentsByArticleIndex(attachments) {
+  const grouped = new Map();
+
+  (attachments || []).forEach((attachment) => {
+    if (!Number.isInteger(attachment?.articleIndex)) {
+      return;
+    }
+
+    const existing = grouped.get(attachment.articleIndex) || [];
+    existing.push(attachment);
+    grouped.set(attachment.articleIndex, existing);
+  });
+
+  return grouped;
+}
+
+function mergeDomAttachmentsIntoPayload(payload) {
+  if (!payload?.messages?.length) {
+    return payload;
+  }
+
+  const entries = extractDomMessageEntries();
+  if (!entries.length || entries.length !== payload.messages.length) {
+    return payload;
+  }
+
+  const attachmentsByArticleIndex = groupAttachmentsByArticleIndex(
+    collectDomAttachments(entries.map((entry) => entry.node))
+  );
+
+  const mergedMessages = payload.messages.map((message, index) => {
+    const entry = entries[index];
+    if (!entry || entry.role !== message.role) {
+      return message;
+    }
+
+    const domAttachments = attachmentsByArticleIndex.get(entry.articleIndex) || [];
+    if (!domAttachments.length) {
+      return message;
+    }
+
+    return {
+      ...message,
+      attachments: normalizeAttachmentList([...(message.attachments || []), ...domAttachments])
+    };
+  });
+
+  return {
+    ...payload,
+    messages: mergedMessages
+  };
 }
 
 function findMessageNodes() {
@@ -684,9 +1338,52 @@ function buildConversationMarkdown(payload) {
     lines.push("");
     lines.push(message.text || "_empty_");
     lines.push("");
+
+    const attachmentLines = buildMessageAttachmentMarkdownLines(message.attachments || []);
+    if (attachmentLines.length) {
+      lines.push(...attachmentLines);
+      lines.push("");
+    }
   }
 
   return lines.join("\n");
+}
+
+function buildMessageAttachmentMarkdownLines(attachments) {
+  const normalized = normalizeAttachmentList(attachments);
+  if (!normalized.length) {
+    return [];
+  }
+
+  const lines = ["Attachments:"];
+  normalized.forEach((attachment, index) => {
+    const label = buildAttachmentMarkdownLabel(attachment, index + 1);
+    const preferredUrl = getPreferredAttachmentDownloadUrl(attachment);
+
+    if (preferredUrl) {
+      lines.push(`- [${label}](${preferredUrl})`);
+    } else if (attachment.pointer) {
+      lines.push(`- ${label} | ${attachment.pointer}`);
+    } else if (attachment.fileId) {
+      lines.push(`- ${label} | ${attachment.fileId}`);
+    } else {
+      lines.push(`- ${label}`);
+    }
+  });
+
+  return lines;
+}
+
+function buildAttachmentMarkdownLabel(attachment, fallbackIndex) {
+  const preferredName =
+    sanitizeFileName(attachment?.name || "") ||
+    buildAttachmentName(attachment, fallbackIndex);
+
+  if (attachment?.mimeType) {
+    return `${preferredName} (${attachment.mimeType})`;
+  }
+
+  return preferredName;
 }
 
 function buildArchiveIndexMarkdown(archive) {
