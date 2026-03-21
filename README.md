@@ -41,6 +41,8 @@ What works today:
   `data:` URLs
 - current-chat export also includes a cleaner self-contained `HTML` reading view
   with a `Print / Save as PDF` button
+- current-chat packages also include `index.html` and `OPEN-THIS-FIRST.html`
+  helper entry files for easier opening after extraction
 - the bundled `HTML` view now renders common Markdown structure and LaTeX-style
   formulas more faithfully than the raw Markdown file, with offline KaTeX CSS
   and fonts packaged into the export folder
@@ -94,6 +96,8 @@ No external server is used.
 - `<topic title> - <local time>.zip`
 - zip contents include:
   - `<topic title> - <local time>.html`
+  - `index.html`
+  - `OPEN-THIS-FIRST.html`
   - `<topic title> - <local time>.md`
   - `<topic title> - <local time>.json`
   - `<topic title> - <local time> - attachments.json`

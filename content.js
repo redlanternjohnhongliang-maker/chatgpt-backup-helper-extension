@@ -920,6 +920,14 @@ async function exportCurrentChatPackage(payload) {
     buildConversationHtml(packagedPayload, assetLookup, exportSupport.html)
   );
   packageFolder.file(
+    "index.html",
+    buildConversationHtml(packagedPayload, assetLookup, exportSupport.html)
+  );
+  packageFolder.file(
+    "OPEN-THIS-FIRST.html",
+    buildConversationHtml(packagedPayload, assetLookup, exportSupport.html)
+  );
+  packageFolder.file(
     buildConversationFilename(packagedPayload, "json", exportStamp),
     JSON.stringify(packagedPayload, null, 2)
   );
@@ -2033,6 +2041,8 @@ function buildConversationMarkdown(payload, assetLookup = null) {
     `# ${payload.title}`,
     "",
     `_Exported on ${exportedAt}_`,
+    "",
+    `_Best reading view: open \`index.html\` or \`OPEN-THIS-FIRST.html\` from the same extracted folder._`,
     ""
   ];
 
@@ -2535,7 +2545,7 @@ function buildMessageAttachmentMarkdownLines(attachments, assetLookup = null) {
     const previewTarget = resolveAttachmentMarkdownPreviewTarget(attachment, assetLookup);
 
     if (isLikelyImageAttachment(attachment) && (previewTarget || localTarget)) {
-      lines.push(`![${label}](${previewTarget || localTarget})`);
+      lines.push(buildImageAttachmentMarkdownHtml(label, previewTarget || localTarget));
       if (localTarget && previewTarget !== localTarget) {
         lines.push(`- [${label}](${localTarget})`);
       }
@@ -2553,6 +2563,15 @@ function buildMessageAttachmentMarkdownLines(attachments, assetLookup = null) {
   });
 
   return lines;
+}
+
+function buildImageAttachmentMarkdownHtml(label, target) {
+  const safeTarget = String(target || "").trim();
+  if (!safeTarget) {
+    return "";
+  }
+
+  return `<img alt="${escapeHtmlAttribute(label)}" src="${escapeHtmlAttribute(safeTarget)}" style="max-width:100%;height:auto;" />`;
 }
 
 function resolveAttachmentMarkdownPreviewTarget(attachment, assetLookup) {
