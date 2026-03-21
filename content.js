@@ -700,10 +700,15 @@ async function exportCurrentChatPackage(payload) {
   const packagedPayload = attachmentBundle.payload;
   const exportStamp = createExportStamp();
   const zip = new globalThis.JSZip();
+  const assetLookup = buildPackagedAssetLookup(attachmentBundle.assets);
 
   zip.file(
     buildConversationFilename(packagedPayload, "md", exportStamp),
-    buildConversationMarkdown(packagedPayload)
+    buildConversationMarkdown(packagedPayload, assetLookup)
+  );
+  zip.file(
+    buildConversationFilename(packagedPayload, "html", exportStamp),
+    buildConversationHtml(packagedPayload, assetLookup)
   );
   zip.file(
     buildConversationFilename(packagedPayload, "json", exportStamp),
@@ -1681,9 +1686,11 @@ function createExportStamp() {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
-function buildConversationMarkdown(payload) {
+function buildConversationMarkdown(payload, assetLookup = null) {
   const lines = [
     `# ${payload.title}`,
+    "",
+    "> Note: If local images do not load in your Markdown viewer, open the bundled HTML export or extract the ZIP first.",
     "",
     `- Exported at: ${payload.exportedAt}`,
     `- Source: ${payload.source}`,
@@ -1699,7 +1706,7 @@ function buildConversationMarkdown(payload) {
     lines.push(message.text || "_empty_");
     lines.push("");
 
-    const attachmentLines = buildMessageAttachmentMarkdownLines(message.attachments || []);
+    const attachmentLines = buildMessageAttachmentMarkdownLines(message.attachments || [], assetLookup);
     if (attachmentLines.length) {
       lines.push(...attachmentLines);
       lines.push("");
@@ -1709,7 +1716,159 @@ function buildConversationMarkdown(payload) {
   return lines.join("\n");
 }
 
-function buildMessageAttachmentMarkdownLines(attachments) {
+function buildConversationHtml(payload, assetLookup) {
+  const sections = (payload.messages || [])
+    .map((message) => buildConversationHtmlSection(message, assetLookup))
+    .join("\n");
+
+  return [
+    "<!doctype html>",
+    '<html lang="en">',
+    "<head>",
+    '<meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    `<title>${escapeHtml(payload.title || "ChatGPT Export")}</title>`,
+    "<style>",
+    "body{font-family:Segoe UI,Arial,sans-serif;margin:32px auto;max-width:980px;padding:0 20px;color:#0f172a;background:#f8fafc;line-height:1.6;}",
+    "h1,h2{margin:0 0 12px;}",
+    ".meta{background:#ffffff;border:1px solid #e2e8f0;border-radius:14px;padding:18px 20px;margin-bottom:24px;}",
+    ".message{background:#ffffff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;margin:0 0 18px;box-shadow:0 8px 24px rgba(15,23,42,0.04);}",
+    ".message pre{white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px;overflow:auto;}",
+    ".message p{margin:0 0 12px;}",
+    ".attachments{margin-top:16px;padding-top:12px;border-top:1px solid #e2e8f0;}",
+    ".attachments ul{margin:8px 0 0 22px;padding:0;}",
+    ".attachments li{margin:8px 0;}",
+    ".attachment-preview{display:block;max-width:100%;height:auto;margin-top:10px;border:1px solid #cbd5e1;border-radius:10px;background:#ffffff;}",
+    ".note{color:#475569;font-size:14px;margin-bottom:16px;}",
+    "a{color:#2563eb;text-decoration:none;}a:hover{text-decoration:underline;}",
+    "code{font-family:Consolas,Menlo,monospace;background:#eff6ff;border-radius:6px;padding:1px 5px;}",
+    "</style>",
+    "</head>",
+    "<body>",
+    `<h1>${escapeHtml(payload.title || "ChatGPT Export")}</h1>`,
+    '<div class="meta">',
+    '<div class="note">This HTML preview is self-contained and is the safest way to view images when opening an export directly from inside a ZIP file.</div>',
+    `<ul><li>Exported at: ${escapeHtml(payload.exportedAt || "")}</li><li>Source: ${escapeHtml(payload.source || "")}</li><li>URL: <a href="${formatHtmlHref(payload.url || "")}">${escapeHtml(payload.url || "")}</a></li><li>Conversation ID: ${escapeHtml(payload.conversationId || "")}</li><li>Message count: ${escapeHtml(String(payload.messageCount || 0))}</li></ul>`,
+    "</div>",
+    sections,
+    "</body>",
+    "</html>"
+  ].join("\n");
+}
+
+function buildConversationHtmlSection(message, assetLookup) {
+  const heading = `${formatRole(message.role)} ${message.index}`;
+  const bodyHtml = renderConversationMessageTextHtml(message.text || "");
+  const attachmentsHtml = buildMessageAttachmentHtml(message.attachments || [], assetLookup);
+
+  return [
+    '<section class="message">',
+    `<h2>${escapeHtml(heading)}</h2>`,
+    bodyHtml || "<p><em>empty</em></p>",
+    attachmentsHtml,
+    "</section>"
+  ].join("\n");
+}
+
+function renderConversationMessageTextHtml(text) {
+  const value = String(text || "");
+  if (!value.trim()) {
+    return "";
+  }
+
+  const segments = [];
+  const parts = value.split(/```/);
+
+  parts.forEach((part, index) => {
+    if (index % 2 === 1) {
+      segments.push(`<pre>${escapeHtml(part.replace(/^\n+|\n+$/g, ""))}</pre>`);
+      return;
+    }
+
+    const paragraphs = part
+      .split(/\n{2,}/)
+      .map((chunk) => chunk.trim())
+      .filter(Boolean);
+
+    paragraphs.forEach((paragraph) => {
+      segments.push(`<p>${renderInlineConversationHtml(paragraph).replace(/\n/g, "<br>")}</p>`);
+    });
+  });
+
+  return segments.join("\n");
+}
+
+function renderInlineConversationHtml(text) {
+  const source = String(text || "");
+  let result = "";
+  let cursor = 0;
+  const markdownLinkPattern = /\[([^\]]+)\]\(([^)]+)\)/g;
+  let match = markdownLinkPattern.exec(source);
+
+  while (match) {
+    result += linkifyPlainText(source.slice(cursor, match.index));
+    result += `<a href="${formatHtmlHref(match[2])}">${escapeHtml(match[1])}</a>`;
+    cursor = match.index + match[0].length;
+    match = markdownLinkPattern.exec(source);
+  }
+
+  result += linkifyPlainText(source.slice(cursor));
+  return result;
+}
+
+function buildMessageAttachmentHtml(attachments, assetLookup) {
+  const normalized = normalizeAttachmentList(attachments);
+  if (!normalized.length) {
+    return "";
+  }
+
+  const items = normalized.map((attachment, index) =>
+    buildSingleAttachmentHtml(attachment, assetLookup, index + 1)
+  );
+
+  return [
+    '<div class="attachments">',
+    "<strong>Attachments</strong>",
+    "<ul>",
+    items.join("\n"),
+    "</ul>",
+    "</div>"
+  ].join("\n");
+}
+
+function buildSingleAttachmentHtml(attachment, assetLookup, fallbackIndex) {
+  const label = buildAttachmentMarkdownLabel(attachment, fallbackIndex);
+  const href = resolveAttachmentHtmlHref(attachment, assetLookup);
+  const preview = buildAttachmentPreviewHtml(attachment, assetLookup, label);
+  const meta = attachment.localPath
+    ? ` <code>${escapeHtml(attachment.localPath)}</code>`
+    : attachment.pointer
+      ? ` <code>${escapeHtml(attachment.pointer)}</code>`
+      : attachment.fileId
+        ? ` <code>${escapeHtml(attachment.fileId)}</code>`
+        : "";
+
+  if (href) {
+    return `<li><a href="${href}" target="_blank" rel="noopener">${escapeHtml(label)}</a>${meta}${preview}</li>`;
+  }
+
+  return `<li>${escapeHtml(label)}${meta}${preview}</li>`;
+}
+
+function buildAttachmentPreviewHtml(attachment, assetLookup, label) {
+  if (!isLikelyImageAttachment(attachment)) {
+    return "";
+  }
+
+  const dataUri = resolveAttachmentPreviewDataUri(attachment, assetLookup);
+  if (!dataUri) {
+    return "";
+  }
+
+  return `<img class="attachment-preview" alt="${escapeHtml(label)}" src="${dataUri}">`;
+}
+
+function buildMessageAttachmentMarkdownLines(attachments, assetLookup = null) {
   const normalized = normalizeAttachmentList(attachments);
   if (!normalized.length) {
     return [];
@@ -1720,11 +1879,12 @@ function buildMessageAttachmentMarkdownLines(attachments) {
     const label = buildAttachmentMarkdownLabel(attachment, index + 1);
     const localTarget = formatMarkdownLinkTarget(attachment.localPath);
     const preferredUrl = formatMarkdownLinkTarget(getPreferredAttachmentDownloadUrl(attachment));
+    const previewTarget = resolveAttachmentMarkdownPreviewTarget(attachment, assetLookup);
 
     if (localTarget) {
       lines.push(`- [${label}](${localTarget})`);
       if (isLikelyImageAttachment(attachment)) {
-        lines.push(`![${label}](${localTarget})`);
+        lines.push(`![${label}](${previewTarget || localTarget})`);
       }
     } else if (preferredUrl) {
       lines.push(`- [${label}](${preferredUrl})`);
@@ -1738,6 +1898,21 @@ function buildMessageAttachmentMarkdownLines(attachments) {
   });
 
   return lines;
+}
+
+function resolveAttachmentMarkdownPreviewTarget(attachment, assetLookup) {
+  if (!isLikelyImageAttachment(attachment)) {
+    return "";
+  }
+
+  if (attachment?.localPath) {
+    const asset = assetLookup?.get(attachment.localPath);
+    if (asset?.dataUri) {
+      return asset.dataUri;
+    }
+  }
+
+  return formatMarkdownLinkTarget(attachment.localPath || getPreferredAttachmentDownloadUrl(attachment));
 }
 
 function buildAttachmentMarkdownLabel(attachment, fallbackIndex) {
@@ -1758,6 +1933,10 @@ function formatMarkdownLinkTarget(value) {
     return "";
   }
 
+  if (/^data:/i.test(target)) {
+    return target;
+  }
+
   if (/^(?:https?:\/\/|mailto:)/i.test(target)) {
     return target.replace(/ /g, "%20").replace(/\(/g, "%28").replace(/\)/g, "%29");
   }
@@ -1766,6 +1945,119 @@ function formatMarkdownLinkTarget(value) {
     .replace(/#/g, "%23")
     .replace(/\(/g, "%28")
     .replace(/\)/g, "%29");
+}
+
+function buildPackagedAssetLookup(assets) {
+  const lookup = new Map();
+
+  (assets || []).forEach((asset) => {
+    lookup.set(asset.localPath, {
+      ...asset,
+      dataUri: shouldInlineHtmlAsset(asset) ? buildAssetDataUri(asset) : ""
+    });
+  });
+
+  return lookup;
+}
+
+function shouldInlineHtmlAsset(asset) {
+  if (!asset) {
+    return false;
+  }
+
+  if (String(asset.mimeType || "").toLowerCase().startsWith("image/")) {
+    return true;
+  }
+
+  const bytesLength = asset.bytes instanceof ArrayBuffer ? asset.bytes.byteLength : 0;
+  return bytesLength > 0 && bytesLength <= 512 * 1024;
+}
+
+function buildAssetDataUri(asset) {
+  if (!asset?.bytes || !(asset.bytes instanceof ArrayBuffer)) {
+    return "";
+  }
+
+  const mimeType = String(asset.mimeType || "").trim() || "application/octet-stream";
+  return `data:${mimeType};base64,${arrayBufferToBase64(asset.bytes)}`;
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = "";
+
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    const chunk = bytes.subarray(offset, offset + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+
+  return btoa(binary);
+}
+
+function resolveAttachmentHtmlHref(attachment, assetLookup) {
+  if (attachment?.localPath) {
+    const asset = assetLookup?.get(attachment.localPath);
+    if (asset?.dataUri) {
+      return asset.dataUri;
+    }
+
+    return formatHtmlHref(attachment.localPath);
+  }
+
+  const remoteTarget = getPreferredAttachmentDownloadUrl(attachment);
+  return remoteTarget ? formatHtmlHref(remoteTarget) : "";
+}
+
+function resolveAttachmentPreviewDataUri(attachment, assetLookup) {
+  if (attachment?.localPath) {
+    return assetLookup?.get(attachment.localPath)?.dataUri || "";
+  }
+
+  return "";
+}
+
+function formatHtmlHref(value) {
+  const target = String(value || "").trim();
+  if (!target) {
+    return "";
+  }
+
+  if (/^data:/i.test(target)) {
+    return target;
+  }
+
+  if (/^(?:https?:\/\/|mailto:)/i.test(target)) {
+    return escapeHtmlAttribute(target.replace(/ /g, "%20"));
+  }
+
+  return escapeHtmlAttribute(
+    encodeURI(target)
+      .replace(/#/g, "%23")
+      .replace(/\(/g, "%28")
+      .replace(/\)/g, "%29")
+  );
+}
+
+function linkifyPlainText(text) {
+  const escaped = escapeHtml(text);
+  return escaped.replace(
+    /(https?:\/\/[^\s<]+|mailto:[^\s<]+)/gi,
+    (match) => `<a href="${formatHtmlHref(match)}">${escapeHtml(match)}</a>`
+  );
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function escapeHtmlAttribute(value) {
+  return escapeHtml(value);
 }
 
 function buildArchiveIndexMarkdown(archive) {

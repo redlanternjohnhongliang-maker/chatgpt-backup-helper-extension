@@ -84,10 +84,14 @@ No external server is used.
 
 - `chatgpt-...zip`
 - zip contents include:
+  - `chatgpt-...html`
   - `chatgpt-...md`
   - `chatgpt-...json`
   - `chatgpt-...attachments-...json`
   - `assets/...`
+
+The bundled `html` file is the safest way to preview images when you open an
+export directly from inside a `.zip` file on Windows.
 
 ### All chats
 
