@@ -40,6 +40,8 @@ What works today:
   paths when the files were successfully captured
 - current-chat export also includes a cleaner self-contained `HTML` reading view
   with a `Print / Save as PDF` button
+- the bundled `HTML` view now renders common Markdown structure and LaTeX-style
+  formulas more faithfully than the raw Markdown file
 - for `file_id` style references, the extension also records fallback download
   candidates from ChatGPT's same-site endpoints
 
@@ -143,6 +145,7 @@ release package for manual installation/testing.
 - `manifest.json`: extension manifest
 - `THIRD_PARTY_NOTICES.md`: bundled library notice information
 - `vendor/jszip.min.js`: bundled zip library used for current-chat package export
+- `vendor/katex.min.js`: bundled math renderer used while generating HTML previews
 - `content.js`: export logic, DOM parsing, floating panel, downloads
 - `page-bridge.js`: same-page bridge for ChatGPT requests
 - `popup.html`: popup UI

@@ -1779,7 +1779,13 @@ function buildConversationHtml(payload, assetLookup) {
     ".role-dot{width:10px;height:10px;border-radius:999px;background:var(--accent);display:inline-block;}",
     ".message.user .role-dot{background:#0284c7;}",
     ".message-body p{margin:0 0 12px;}",
+    ".message-body h3,.message-body h4,.message-body h5,.message-body h6{margin:18px 0 10px;line-height:1.3;}",
+    ".message-body ul,.message-body ol{margin:0 0 12px 24px;padding:0;}",
+    ".message-body li{margin:6px 0;}",
+    ".message-body hr{border:none;border-top:1px solid var(--line);margin:18px 0;}",
     ".message-body pre{white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid var(--line);border-radius:14px;padding:14px;overflow:auto;margin:0 0 12px;}",
+    ".message-body strong{font-weight:700;}",
+    ".message-body em{font-style:italic;}",
     ".attachments{margin-top:14px;display:flex;flex-direction:column;gap:12px;}",
     ".attachment-list{display:flex;flex-wrap:wrap;gap:10px;}",
     ".attachment-link{display:inline-flex;align-items:center;gap:8px;max-width:100%;padding:10px 12px;border-radius:14px;background:#fff;border:1px solid var(--line);text-decoration:none;color:var(--text);}",
@@ -1787,6 +1793,9 @@ function buildConversationHtml(payload, assetLookup) {
     ".attachment-preview{display:block;max-width:100%;height:auto;border:1px solid #cbd5e1;border-radius:16px;background:#ffffff;}",
     "a{color:var(--accent);text-decoration:none;}a:hover{text-decoration:underline;}",
     "code{font-family:Consolas,Menlo,monospace;background:#eff6ff;border-radius:6px;padding:1px 5px;}",
+    ".math-inline{display:inline-block;vertical-align:middle;max-width:100%;}",
+    ".math-display{display:block;overflow:auto;margin:14px 0;padding:6px 0;}",
+    ".math-fallback{color:var(--muted);}",
     "@media print{body{background:#ffffff;} .page{max-width:none;padding:0;} .hero-actions,.meta{display:none;} .message{box-shadow:none;break-inside:avoid-page;page-break-inside:avoid;} a{color:inherit;text-decoration:none;}}",
     "@media (max-width:720px){.hero{flex-direction:column;} .hero-actions{justify-content:flex-start;} .hero-text h1{font-size:34px;}}",
     "</style>",
@@ -1836,44 +1845,291 @@ function renderConversationMessageTextHtml(text) {
     return "";
   }
 
-  const segments = [];
-  const parts = value.split(/```/);
+  const blocks = tokenizeMarkdownBlocks(value);
+  return blocks.map((block) => renderMarkdownBlock(block)).filter(Boolean).join("\n");
+}
 
-  parts.forEach((part, index) => {
-    if (index % 2 === 1) {
-      segments.push(`<pre>${escapeHtml(part.replace(/^\n+|\n+$/g, ""))}</pre>`);
-      return;
+function tokenizeMarkdownBlocks(text) {
+  const lines = normalizeLineEndings(String(text || "")).split("\n");
+  const blocks = [];
+
+  for (let index = 0; index < lines.length;) {
+    const line = lines[index];
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      index += 1;
+      continue;
     }
 
-    const paragraphs = part
-      .split(/\n{2,}/)
-      .map((chunk) => chunk.trim())
-      .filter(Boolean);
+    if (/^```/.test(trimmed)) {
+      const language = trimmed.slice(3).trim();
+      const codeLines = [];
+      index += 1;
 
-    paragraphs.forEach((paragraph) => {
-      segments.push(`<p>${renderInlineConversationHtml(paragraph).replace(/\n/g, "<br>")}</p>`);
+      while (index < lines.length && !/^```/.test(lines[index].trim())) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+
+      if (index < lines.length) {
+        index += 1;
+      }
+
+      blocks.push({
+        type: "code",
+        language,
+        content: codeLines.join("\n")
+      });
+      continue;
+    }
+
+    if (trimmed === "\\[" || trimmed.startsWith("\\[")) {
+      const mathLines = [];
+      let current = trimmed.startsWith("\\[") ? line.replace(/^\s*\\\[/, "") : "";
+      if (current.trim()) {
+        mathLines.push(current);
+      }
+      index += 1;
+
+      while (index < lines.length) {
+        const currentLine = lines[index];
+        if (currentLine.trim() === "\\]") {
+          index += 1;
+          break;
+        }
+
+        if (currentLine.includes("\\]")) {
+          mathLines.push(currentLine.replace(/\\\]\s*$/, ""));
+          index += 1;
+          break;
+        }
+
+        mathLines.push(currentLine);
+        index += 1;
+      }
+
+      blocks.push({
+        type: "math-display",
+        content: mathLines.join("\n").trim()
+      });
+      continue;
+    }
+
+    if (/^\$\$/.test(trimmed)) {
+      const mathLines = [];
+      let firstLine = line.replace(/^\s*\$\$/, "");
+      if (firstLine.trim()) {
+        if (/\$\$\s*$/.test(firstLine)) {
+          mathLines.push(firstLine.replace(/\$\$\s*$/, ""));
+          index += 1;
+          blocks.push({
+            type: "math-display",
+            content: mathLines.join("\n").trim()
+          });
+          continue;
+        }
+        mathLines.push(firstLine);
+      }
+
+      index += 1;
+      while (index < lines.length) {
+        const currentLine = lines[index];
+        if (/\$\$\s*$/.test(currentLine.trim())) {
+          mathLines.push(currentLine.replace(/\$\$\s*$/, ""));
+          index += 1;
+          break;
+        }
+
+        mathLines.push(currentLine);
+        index += 1;
+      }
+
+      blocks.push({
+        type: "math-display",
+        content: mathLines.join("\n").trim()
+      });
+      continue;
+    }
+
+    const headingMatch = line.match(/^\s*(#{1,6})\s+(.*)$/);
+    if (headingMatch) {
+      blocks.push({
+        type: "heading",
+        level: Math.min(6, headingMatch[1].length + 2),
+        content: headingMatch[2].trim()
+      });
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*(?:---+|\*\*\*+|___+)\s*$/.test(line)) {
+      blocks.push({
+        type: "hr"
+      });
+      index += 1;
+      continue;
+    }
+
+    const unorderedMatch = line.match(/^\s*[-*+]\s+(.*)$/);
+    if (unorderedMatch) {
+      const items = [];
+      while (index < lines.length) {
+        const match = lines[index].match(/^\s*[-*+]\s+(.*)$/);
+        if (!match) {
+          break;
+        }
+        items.push(match[1]);
+        index += 1;
+      }
+
+      blocks.push({
+        type: "list",
+        ordered: false,
+        items
+      });
+      continue;
+    }
+
+    const orderedMatch = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (orderedMatch) {
+      const items = [];
+      while (index < lines.length) {
+        const match = lines[index].match(/^\s*\d+\.\s+(.*)$/);
+        if (!match) {
+          break;
+        }
+        items.push(match[1]);
+        index += 1;
+      }
+
+      blocks.push({
+        type: "list",
+        ordered: true,
+        items
+      });
+      continue;
+    }
+
+    const paragraphLines = [];
+    while (index < lines.length) {
+      const candidate = lines[index];
+      const candidateTrimmed = candidate.trim();
+
+      if (!candidateTrimmed) {
+        index += 1;
+        break;
+      }
+
+      if (
+        /^```/.test(candidateTrimmed) ||
+        candidateTrimmed === "\\[" ||
+        candidateTrimmed.startsWith("\\[") ||
+        /^\$\$/.test(candidateTrimmed) ||
+        /^\s*(#{1,6})\s+/.test(candidate) ||
+        /^\s*(?:---+|\*\*\*+|___+)\s*$/.test(candidate) ||
+        /^\s*[-*+]\s+/.test(candidate) ||
+        /^\s*\d+\.\s+/.test(candidate)
+      ) {
+        break;
+      }
+
+      paragraphLines.push(candidate);
+      index += 1;
+    }
+
+    blocks.push({
+      type: "paragraph",
+      content: paragraphLines.join("\n").trim()
     });
-  });
+  }
 
-  return segments.join("\n");
+  return blocks;
+}
+
+function renderMarkdownBlock(block) {
+  switch (block?.type) {
+    case "heading":
+      return `<h${block.level}>${renderInlineConversationHtml(block.content)}</h${block.level}>`;
+    case "paragraph":
+      return `<p>${renderInlineConversationHtml(block.content).replace(/\n/g, "<br>")}</p>`;
+    case "hr":
+      return "<hr>";
+    case "code":
+      return `<pre><code>${escapeHtml(block.content || "")}</code></pre>`;
+    case "math-display":
+      return renderMathExpression(block.content || "", true);
+    case "list": {
+      const tag = block.ordered ? "ol" : "ul";
+      const items = (block.items || [])
+        .map((item) => `<li>${renderInlineConversationHtml(item)}</li>`)
+        .join("");
+      return `<${tag}>${items}</${tag}>`;
+    }
+    default:
+      return "";
+  }
 }
 
 function renderInlineConversationHtml(text) {
-  const source = String(text || "");
-  let result = "";
-  let cursor = 0;
-  const markdownLinkPattern = /\[([^\]]+)\]\(([^)]+)\)/g;
-  let match = markdownLinkPattern.exec(source);
+  const placeholders = [];
+  const stash = (html) => {
+    const key = `%%HTML_TOKEN_${placeholders.length}%%`;
+    placeholders.push({ key, html });
+    return key;
+  };
 
-  while (match) {
-    result += linkifyPlainText(source.slice(cursor, match.index));
-    result += `<a href="${formatHtmlHref(match[2])}">${escapeHtml(match[1])}</a>`;
-    cursor = match.index + match[0].length;
-    match = markdownLinkPattern.exec(source);
+  let source = String(text || "");
+
+  source = source.replace(/`([^`]+)`/g, (_match, code) => stash(`<code>${escapeHtml(code)}</code>`));
+  source = source.replace(/\\\(((?:.|\n)+?)\\\)/g, (_match, expression) => stash(renderMathExpression(expression, false)));
+  source = source.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, label, href) => {
+    return stash(`<a href="${formatHtmlHref(href)}">${escapeHtml(label)}</a>`);
+  });
+  source = source.replace(/(https?:\/\/[^\s<]+|mailto:[^\s<]+)/gi, (match) => {
+    return stash(`<a href="${formatHtmlHref(match)}">${escapeHtml(match)}</a>`);
+  });
+
+  let result = escapeHtml(source);
+
+  result = result.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  result = result.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+  result = result.replace(/(^|[^\*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+  result = result.replace(/(^|[^_])_([^_\n]+)_(?!_)/g, "$1<em>$2</em>");
+
+  placeholders.forEach((placeholder) => {
+    result = result.replace(placeholder.key, placeholder.html);
+  });
+
+  return result;
+}
+
+function renderMathExpression(expression, displayMode) {
+  const source = String(expression || "").trim();
+  if (!source) {
+    return "";
   }
 
-  result += linkifyPlainText(source.slice(cursor));
-  return result;
+  if (globalThis.katex?.renderToString) {
+    try {
+      const markup = globalThis.katex.renderToString(source, {
+        displayMode,
+        throwOnError: false,
+        strict: "ignore",
+        output: "mathml"
+      });
+
+      return displayMode
+        ? `<div class="math-display">${markup}</div>`
+        : `<span class="math-inline">${markup}</span>`;
+    } catch (_error) {
+      // Fall through to escaped fallback below.
+    }
+  }
+
+  return displayMode
+    ? `<pre class="math-fallback">${escapeHtml(source)}</pre>`
+    : `<code class="math-fallback">${escapeHtml(source)}</code>`;
 }
 
 function buildMessageAttachmentHtml(attachments, assetLookup) {
