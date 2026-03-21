@@ -42,6 +42,8 @@ What works today:
   with a `Print / Save as PDF` button
 - the bundled `HTML` view now renders common Markdown structure and LaTeX-style
   formulas more faithfully than the raw Markdown file
+- current-chat zip now extracts into one top-level folder instead of scattering
+  files directly into the destination
 - for `file_id` style references, the extension also records fallback download
   candidates from ChatGPT's same-site endpoints
 

@@ -695,31 +695,33 @@ async function exportCurrentChatPackage(payload) {
   const attachmentBundle = await buildCurrentChatAttachmentBundle(preparedPayload);
   const packagedPayload = attachmentBundle.payload;
   const exportStamp = createExportStamp();
+  const packageFolderName = buildConversationFileBase(packagedPayload, exportStamp);
   const zip = new globalThis.JSZip();
+  const packageFolder = zip.folder(packageFolderName);
   const assetLookup = buildPackagedAssetLookup(attachmentBundle.assets);
 
-  zip.file(
+  packageFolder.file(
     buildConversationFilename(packagedPayload, "md", exportStamp),
     buildConversationMarkdown(packagedPayload, assetLookup)
   );
-  zip.file(
+  packageFolder.file(
     buildConversationFilename(packagedPayload, "html", exportStamp),
     buildConversationHtml(packagedPayload, assetLookup)
   );
-  zip.file(
+  packageFolder.file(
     buildConversationFilename(packagedPayload, "json", exportStamp),
     JSON.stringify(packagedPayload, null, 2)
   );
 
   if (attachmentBundle.totalCount > 0) {
-    zip.file(
+    packageFolder.file(
       buildConversationExtraFilename(packagedPayload, "attachments", "json", exportStamp),
       JSON.stringify(attachmentBundle.manifest, null, 2)
     );
   }
 
   attachmentBundle.assets.forEach((asset) => {
-    zip.file(asset.localPath, asset.bytes);
+    packageFolder.file(asset.localPath, asset.bytes);
   });
 
   const zipFileName = buildConversationFilename(packagedPayload, "zip", exportStamp);
@@ -991,11 +993,13 @@ function collectDomAttachments(nodes = Array.from(document.querySelectorAll("mai
     article.querySelectorAll("img").forEach((image, imageIndex) => {
       const src = image.currentSrc || image.src || "";
       const looksDownloadable = /^https?:\/\//i.test(src) || /^blob:/i.test(src) || /^data:/i.test(src);
-      const largeEnough =
-        Number(image.naturalWidth || image.width || 0) >= 96 ||
-        Number(image.naturalHeight || image.height || 0) >= 96;
+      const visibleEnough =
+        Number(image.naturalWidth || image.width || 0) >= 32 ||
+        Number(image.naturalHeight || image.height || 0) >= 32 ||
+        Boolean(image.closest("a[href]")) ||
+        Boolean((image.getAttribute("alt") || "").trim());
 
-      if (!looksDownloadable || !largeEnough) {
+      if (!looksDownloadable || !visibleEnough) {
         return;
       }
 
@@ -2074,7 +2078,7 @@ function renderMarkdownBlock(block) {
 function renderInlineConversationHtml(text) {
   const placeholders = [];
   const stash = (html) => {
-    const key = `%%HTML_TOKEN_${placeholders.length}%%`;
+    const key = `@@HTMLTOKEN${placeholders.length}@@`;
     placeholders.push({ key, html });
     return key;
   };
@@ -2189,14 +2193,16 @@ function buildFileAttachmentHtml(attachment, assetLookup, fallbackIndex) {
 function buildImageAttachmentHtml(attachment, assetLookup, fallbackIndex) {
   const label = buildAttachmentMarkdownLabel(attachment, fallbackIndex);
   const dataUri = resolveAttachmentPreviewDataUri(attachment, assetLookup);
-  if (!dataUri) {
-    return "";
+  const href = resolveAttachmentHtmlHref(attachment, assetLookup) || formatHtmlHref(attachment.localPath);
+  const imageSource = dataUri || formatHtmlHref(attachment.localPath);
+
+  if (!imageSource) {
+    return buildFileAttachmentHtml(attachment, assetLookup, fallbackIndex);
   }
 
-  const href = resolveAttachmentHtmlHref(attachment, assetLookup) || dataUri;
   return [
-    `<a href="${href}" target="_blank" rel="noopener">`,
-    `<img class="attachment-preview" alt="${escapeHtml(label)}" src="${dataUri}">`,
+    `<a href="${href || imageSource}" target="_blank" rel="noopener">`,
+    `<img class="attachment-preview" alt="${escapeHtml(label)}" src="${imageSource}">`,
     "</a>"
   ].join("");
 }
@@ -2216,6 +2222,9 @@ function buildMessageAttachmentMarkdownLines(attachments, assetLookup = null) {
 
     if (isLikelyImageAttachment(attachment) && (previewTarget || localTarget)) {
       lines.push(`![${label}](${previewTarget || localTarget})`);
+      if (localTarget && previewTarget !== localTarget) {
+        lines.push(`- [${label}](${localTarget})`);
+      }
     } else if (localTarget) {
       lines.push(`- [${label}](${localTarget})`);
     } else if (preferredUrl) {
