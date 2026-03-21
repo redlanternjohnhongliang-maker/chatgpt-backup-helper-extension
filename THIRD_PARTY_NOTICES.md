@@ -15,6 +15,7 @@ current-chat export zip package in the browser.
 - Version: 0.16.11
 - License: MIT
 
-The file `vendor/katex.min.js` is a bundled copy of KaTeX used during export to
-turn common LaTeX-style formulas into rendered math inside the generated HTML
-preview.
+The files `vendor/katex.min.js`, `vendor/katex.min.css`, and
+`vendor/katex-fonts/*.woff2` are bundled copies of KaTeX runtime assets used
+during export to render common LaTeX-style formulas inside the generated HTML
+preview, including offline viewing after extraction.

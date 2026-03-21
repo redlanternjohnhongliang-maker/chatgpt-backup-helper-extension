@@ -375,13 +375,53 @@ function toVisibleExportMessage(message) {
 }
 
 function cleanExportMessageText(role, text) {
-  let cleaned = normalizeWhitespace(text);
+  let cleaned = stripExportFormattingArtifacts(normalizeWhitespace(text));
 
   if (role === "user") {
     cleaned = summarizeUserAttachments(cleaned);
   }
 
   return normalizeWhitespace(cleaned);
+}
+
+function stripExportFormattingArtifacts(text) {
+  let cleaned = normalizeLineEndings(String(text || ""));
+
+  cleaned = cleaned.replace(/entity(\[[^\]]+\])/g, (_match, payload) => formatInlineEntityPayload(payload));
+  cleaned = cleaned.replace(/\bEntity[A-Za-z]*\s*(\[[^\]]+\])/g, (_match, payload) => formatInlineEntityPayload(payload));
+  cleaned = cleaned.replace(/cite[^]*/g, "");
+  cleaned = cleaned.replace(/navlist[^]*/g, "");
+  cleaned = cleaned.replace(/[^]*/g, "");
+  cleaned = cleaned.replace(/〖\d+:\d+†[^〗]+〗/g, "");
+
+  return cleaned;
+}
+
+function formatInlineEntityPayload(payloadText) {
+  const parsed = parseInlineEntityPayload(payloadText);
+  if (Array.isArray(parsed) && parsed.length >= 2) {
+    return String(parsed[1] || "").trim();
+  }
+
+  return "";
+}
+
+function parseInlineEntityPayload(payloadText) {
+  const text = String(payloadText || "").trim();
+  if (!text) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch (_error) {
+    return text
+      .replace(/^\[/, "")
+      .replace(/\]$/, "")
+      .split(/\s*,\s*/)
+      .map((part) => part.replace(/^["']|["']$/g, ""));
+  }
 }
 
 function summarizeUserAttachments(text) {
@@ -610,8 +650,7 @@ function buildAttachmentFromString(stringValue, path) {
 }
 
 function normalizeAttachmentList(attachments) {
-  const seen = new Set();
-  const results = [];
+  const merged = new Map();
 
   for (const attachment of attachments || []) {
     if (!attachment) {
@@ -633,11 +672,12 @@ function normalizeAttachmentList(attachments) {
     };
 
     normalized.downloadUrl = firstDownloadLikeString([attachment.downloadUrl]) || "";
-    normalized.downloadCandidates = uniqueDownloadCandidates([
+    normalized.downloadCandidates = buildOrderedAttachmentDownloadCandidates([
       ...(Array.isArray(attachment.downloadCandidates) ? attachment.downloadCandidates : []),
       normalized.downloadUrl,
       ...buildFallbackAttachmentDownloadCandidates(normalized.fileId)
     ]);
+    normalized.downloadUrl = selectPreferredAttachmentDownloadUrl(normalized.downloadCandidates);
 
     if (!normalized.pointer && !normalized.downloadUrl && !normalized.fileId) {
       continue;
@@ -647,22 +687,192 @@ function normalizeAttachmentList(attachments) {
       normalized.name = buildAttachmentName(normalized);
     }
 
-    const fingerprint = [
-      normalized.pointer,
-      normalized.downloadUrl,
-      normalized.fileId,
-      normalized.name
-    ].join("|");
-
-    if (seen.has(fingerprint)) {
+    const mergeKey = buildAttachmentMergeKey(normalized);
+    if (!mergeKey) {
       continue;
     }
 
-    seen.add(fingerprint);
-    results.push(normalized);
+    const existing = merged.get(mergeKey);
+    if (existing) {
+      merged.set(mergeKey, mergeAttachmentRecords(existing, normalized));
+      continue;
+    }
+
+    merged.set(mergeKey, normalized);
   }
 
-  return results;
+  return Array.from(merged.values());
+}
+
+function buildAttachmentMergeKey(attachment) {
+  const messageIndex = Number.isFinite(Number(attachment?.messageIndex))
+    ? Number(attachment.messageIndex)
+    : "";
+  const fileId = stringOrEmpty(attachment?.fileId);
+  if (fileId) {
+    return `file:${messageIndex}:${fileId}`;
+  }
+
+  const pointer = stringOrEmpty(attachment?.pointer);
+  if (pointer) {
+    return `pointer:${messageIndex}:${pointer}`;
+  }
+
+  const downloadUrl = selectPreferredAttachmentDownloadUrl(
+    buildOrderedAttachmentDownloadCandidates([
+      attachment?.downloadUrl,
+      ...(Array.isArray(attachment?.downloadCandidates) ? attachment.downloadCandidates : [])
+    ])
+  );
+  if (downloadUrl) {
+    return `url:${messageIndex}:${downloadUrl}`;
+  }
+
+  const safeName = sanitizeFileName(attachment?.name || "");
+  return safeName ? `name:${messageIndex}:${safeName}` : "";
+}
+
+function mergeAttachmentRecords(existing, incoming) {
+  const downloadCandidates = buildOrderedAttachmentDownloadCandidates([
+    ...(existing.downloadCandidates || []),
+    ...(incoming.downloadCandidates || []),
+    existing.downloadUrl,
+    incoming.downloadUrl
+  ]);
+
+  const merged = {
+    ...existing,
+    source: chooseLongerText(existing.source, incoming.source),
+    sourcePath: mergeSourcePaths(existing.sourcePath, incoming.sourcePath),
+    role: existing.role || incoming.role,
+    messageIndex:
+      Number.isFinite(Number(existing.messageIndex)) ? Number(existing.messageIndex) : incoming.messageIndex,
+    pointer: chooseHigherScoredValue(existing.pointer, incoming.pointer, scoreAttachmentPointer),
+    fileId: existing.fileId || incoming.fileId,
+    mimeType: chooseHigherScoredValue(existing.mimeType, incoming.mimeType, scoreAttachmentMimeType),
+    name: chooseHigherScoredValue(existing.name, incoming.name, scoreAttachmentName),
+    sizeBytes: chooseAttachmentSize(existing.sizeBytes, incoming.sizeBytes),
+    localPath: chooseHigherScoredValue(existing.localPath, incoming.localPath, scoreAttachmentPath),
+    downloadStatus: chooseAttachmentDownloadStatus(existing.downloadStatus, incoming.downloadStatus),
+    downloadCandidates
+  };
+
+  merged.downloadUrl = selectPreferredAttachmentDownloadUrl(downloadCandidates);
+  if (!merged.name) {
+    merged.name = buildAttachmentName(merged);
+  }
+
+  return merged;
+}
+
+function chooseLongerText(left, right) {
+  return String(right || "").trim().length > String(left || "").trim().length
+    ? String(right || "").trim()
+    : String(left || "").trim();
+}
+
+function mergeSourcePaths(left, right) {
+  return Array.from(new Set([String(left || "").trim(), String(right || "").trim()].filter(Boolean))).join(" | ");
+}
+
+function chooseHigherScoredValue(left, right, scorer) {
+  const leftValue = String(left || "").trim();
+  const rightValue = String(right || "").trim();
+  if (!leftValue) {
+    return rightValue;
+  }
+  if (!rightValue) {
+    return leftValue;
+  }
+
+  const leftScore = scorer(leftValue);
+  const rightScore = scorer(rightValue);
+  if (rightScore > leftScore) {
+    return rightValue;
+  }
+  if (leftScore > rightScore) {
+    return leftValue;
+  }
+
+  return rightValue.length > leftValue.length ? rightValue : leftValue;
+}
+
+function scoreAttachmentPointer(value) {
+  return value ? 1 : 0;
+}
+
+function scoreAttachmentMimeType(value) {
+  const mime = String(value || "").toLowerCase();
+  if (!mime) {
+    return 0;
+  }
+  if (mime.startsWith("image/")) {
+    return 8;
+  }
+  if (mime === "application/pdf") {
+    return 7;
+  }
+  if (/word|excel|powerpoint|sheet|presentation/.test(mime)) {
+    return 6;
+  }
+  if (mime.startsWith("text/")) {
+    return 5;
+  }
+  if (mime === "application/json") {
+    return 1;
+  }
+  return 4;
+}
+
+function scoreAttachmentName(value) {
+  const name = sanitizeFileName(value || "");
+  if (!name) {
+    return 0;
+  }
+
+  let score = 1;
+  if (/\.[a-z0-9]{1,8}$/i.test(name)) {
+    score += 5;
+  }
+  if (/^attachment[-_]/i.test(name)) {
+    score -= 1;
+  }
+  if (/^file[_-][a-z0-9_-]+$/i.test(name)) {
+    score -= 3;
+  }
+
+  return score;
+}
+
+function scoreAttachmentPath(value) {
+  const path = String(value || "").toLowerCase();
+  if (!path) {
+    return 0;
+  }
+  if (/\.(png|jpe?g|gif|webp|svg)$/i.test(path)) {
+    return 7;
+  }
+  if (/\.(pdf|docx?|xlsx?|pptx?|csv|txt)$/i.test(path)) {
+    return 6;
+  }
+  if (/\.json$/i.test(path)) {
+    return 1;
+  }
+  return 4;
+}
+
+function chooseAttachmentSize(left, right) {
+  const leftNumber = Number.isFinite(Number(left)) ? Number(left) : 0;
+  const rightNumber = Number.isFinite(Number(right)) ? Number(right) : 0;
+  return Math.max(leftNumber, rightNumber) || null;
+}
+
+function chooseAttachmentDownloadStatus(left, right) {
+  if (String(left || "").toLowerCase() === "downloaded" || String(right || "").toLowerCase() !== "downloaded") {
+    return left || right || "";
+  }
+
+  return right || left || "";
 }
 
 function pushAttachmentCandidate(candidate, results, seen) {
@@ -693,6 +903,7 @@ async function exportCurrentChatPackage(payload) {
 
   const preparedPayload = await enrichPayloadAttachmentCandidates(payload);
   const attachmentBundle = await buildCurrentChatAttachmentBundle(preparedPayload);
+  const exportSupport = await buildConversationExportSupportFiles();
   const packagedPayload = attachmentBundle.payload;
   const exportStamp = createExportStamp();
   const packageFolderName = buildConversationFileBase(packagedPayload, exportStamp);
@@ -706,7 +917,7 @@ async function exportCurrentChatPackage(payload) {
   );
   packageFolder.file(
     buildConversationFilename(packagedPayload, "html", exportStamp),
-    buildConversationHtml(packagedPayload, assetLookup)
+    buildConversationHtml(packagedPayload, assetLookup, exportSupport.html)
   );
   packageFolder.file(
     buildConversationFilename(packagedPayload, "json", exportStamp),
@@ -722,6 +933,9 @@ async function exportCurrentChatPackage(payload) {
 
   attachmentBundle.assets.forEach((asset) => {
     packageFolder.file(asset.localPath, asset.bytes);
+  });
+  (exportSupport.files || []).forEach((file) => {
+    packageFolder.file(file.localPath, file.body);
   });
 
   const zipFileName = buildConversationFilename(packagedPayload, "zip", exportStamp);
@@ -842,7 +1056,7 @@ async function downloadAttachmentsForPackage(attachments) {
 }
 
 async function downloadSingleAttachmentAsset(attachment, order) {
-  const candidates = uniqueDownloadCandidates([
+  const candidates = buildOrderedAttachmentDownloadCandidates([
     getPreferredAttachmentDownloadUrl(attachment),
     ...(Array.isArray(attachment?.downloadCandidates) ? attachment.downloadCandidates : [])
   ]);
@@ -851,32 +1065,78 @@ async function downloadSingleAttachmentAsset(attachment, order) {
     return null;
   }
 
-  try {
-    const resource = await bridgeRequest("fetch-binary-resource", {
-      url: candidates[0],
-      candidates
-    });
+  let metadataFallback = null;
 
-    const bytes = resource?.bytes;
-    if (!(bytes instanceof ArrayBuffer) || bytes.byteLength === 0) {
+  for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+    try {
+      const pendingCandidates = candidates.slice(candidateIndex);
+      const resource = await bridgeRequest("fetch-binary-resource", {
+        url: pendingCandidates[0],
+        candidates: pendingCandidates
+      });
+
+      const bytes = resource?.bytes;
+      if (!(bytes instanceof ArrayBuffer) || bytes.byteLength === 0) {
+        continue;
+      }
+
+      if (isLikelyAttachmentMetadataResource(resource)) {
+        metadataFallback = metadataFallback || buildDownloadedAttachmentAsset(attachment, order, resource);
+        continue;
+      }
+
+      return buildDownloadedAttachmentAsset(attachment, order, resource);
+    } catch (_error) {
+      // Keep probing remaining candidates below.
+    }
+  }
+
+  return metadataFallback;
+}
+
+function buildDownloadedAttachmentAsset(attachment, order, resource) {
+  const enrichedAttachment = {
+    ...attachment,
+    mimeType: stringOrEmpty(resource?.contentType) || attachment.mimeType,
+    name: stringOrEmpty(resource?.fileName) || attachment.name
+  };
+
+  return {
+    order,
+    matchKey: buildAttachmentMatchKey(attachment),
+    localPath: buildAttachmentLocalPath(enrichedAttachment, order),
+    bytes: resource.bytes,
+    sourceUrl: stringOrEmpty(resource?.finalUrl) || getPreferredAttachmentDownloadUrl(attachment),
+    mimeType: stringOrEmpty(resource?.contentType) || attachment.mimeType,
+    fileName: stringOrEmpty(resource?.fileName) || buildAttachmentName(enrichedAttachment, order)
+  };
+}
+
+function isLikelyAttachmentMetadataResource(resource) {
+  const bytes = resource?.bytes;
+  if (!(bytes instanceof ArrayBuffer) || bytes.byteLength === 0 || bytes.byteLength > 128 * 1024) {
+    return false;
+  }
+
+  const contentType = String(resource?.contentType || "").toLowerCase();
+  const fileName = String(resource?.fileName || "").toLowerCase();
+  if (!/json/.test(contentType) && !/\.json(?:$|\?)/.test(fileName)) {
+    return false;
+  }
+
+  return Boolean(parseAttachmentMetadataPayload(bytes));
+}
+
+function parseAttachmentMetadataPayload(buffer) {
+  try {
+    const text = new TextDecoder("utf-8").decode(new Uint8Array(buffer));
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       return null;
     }
 
-    const enrichedAttachment = {
-      ...attachment,
-      mimeType: stringOrEmpty(resource.contentType) || attachment.mimeType,
-      name: stringOrEmpty(resource.fileName) || attachment.name
-    };
-
-    return {
-      order,
-      matchKey: buildAttachmentMatchKey(attachment),
-      localPath: buildAttachmentLocalPath(enrichedAttachment, order),
-      bytes,
-      sourceUrl: stringOrEmpty(resource.finalUrl) || candidates[0],
-      mimeType: stringOrEmpty(resource.contentType) || attachment.mimeType,
-      fileName: stringOrEmpty(resource.fileName) || buildAttachmentName(enrichedAttachment, order)
-    };
+    const metadataKeys = ["id", "name", "mime_type", "file_extension", "state", "use_case"];
+    return metadataKeys.some((key) => Object.prototype.hasOwnProperty.call(parsed, key)) ? parsed : null;
   } catch (_error) {
     return null;
   }
@@ -1113,10 +1373,10 @@ function buildAttachmentName(attachment, fallbackIndex = 1) {
 }
 
 function getPreferredAttachmentDownloadUrl(attachment) {
-  return firstDownloadLikeString([
+  return selectPreferredAttachmentDownloadUrl(buildOrderedAttachmentDownloadCandidates([
     attachment?.downloadUrl,
     ...(Array.isArray(attachment?.downloadCandidates) ? attachment.downloadCandidates : [])
-  ]);
+  ]));
 }
 
 function buildAttachmentLocalPath(attachment, fallbackIndex = 1) {
@@ -1268,6 +1528,53 @@ function uniqueDownloadCandidates(values) {
   }
 
   return results;
+}
+
+function buildOrderedAttachmentDownloadCandidates(values) {
+  return uniqueDownloadCandidates(values).sort((left, right) => {
+    const scoreDelta = scoreAttachmentDownloadCandidate(right) - scoreAttachmentDownloadCandidate(left);
+    if (scoreDelta !== 0) {
+      return scoreDelta;
+    }
+
+    return String(left || "").length - String(right || "").length;
+  });
+}
+
+function selectPreferredAttachmentDownloadUrl(values) {
+  return buildOrderedAttachmentDownloadCandidates(values)[0] || "";
+}
+
+function scoreAttachmentDownloadCandidate(value) {
+  const url = String(value || "").trim();
+  if (!url) {
+    return 0;
+  }
+
+  let score = 0;
+  if (/^data:/i.test(url)) {
+    score += 20;
+  }
+  if (/^blob:/i.test(url)) {
+    score += 15;
+  }
+  if (/files\.oaiusercontent\.com/i.test(url)) {
+    score += 90;
+  }
+  if (/\/backend-api\/estuary\/content/i.test(url)) {
+    score += 80;
+  }
+  if (/\/backend-api\/files\/[^/?#]+\/download(?:$|\?)/i.test(url)) {
+    score += 70;
+  }
+  if (/\?download=true/i.test(url)) {
+    score -= 25;
+  }
+  if (/\.(png|jpe?g|gif|webp|svg|pdf|txt|csv|json|zip|docx?|xlsx?|pptx?)(?:$|\?)/i.test(url)) {
+    score += 10;
+  }
+
+  return score;
 }
 
 function firstDownloadLikeString(values) {
@@ -1747,7 +2054,7 @@ function buildConversationMarkdown(payload, assetLookup = null) {
   return lines.join("\n");
 }
 
-function buildConversationHtml(payload, assetLookup) {
+function buildConversationHtml(payload, assetLookup, exportSupport = {}) {
   const exportedAt = formatExportedAt(payload.exportedAt);
   const sections = (payload.messages || [])
     .map((message) => buildConversationHtmlSection(message, assetLookup))
@@ -1760,6 +2067,9 @@ function buildConversationHtml(payload, assetLookup) {
     '<meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width, initial-scale=1">',
     `<title>${escapeHtml(payload.title || "ChatGPT Export")}</title>`,
+    exportSupport?.katexStylesheetPath
+      ? `<link rel="stylesheet" href="${formatHtmlHref(exportSupport.katexStylesheetPath)}">`
+      : "",
     "<style>",
     ":root{color-scheme:light;--bg:#f3f6fb;--card:#ffffff;--text:#0f172a;--muted:#64748b;--line:#dbe4ee;--user-bg:#eaf4ff;--assistant-bg:#ffffff;--accent:#2563eb;}",
     "*{box-sizing:border-box;}",
@@ -1798,7 +2108,10 @@ function buildConversationHtml(payload, assetLookup) {
     "a{color:var(--accent);text-decoration:none;}a:hover{text-decoration:underline;}",
     "code{font-family:Consolas,Menlo,monospace;background:#eff6ff;border-radius:6px;padding:1px 5px;}",
     ".math-inline{display:inline-block;vertical-align:middle;max-width:100%;}",
-    ".math-display{display:block;overflow:auto;margin:14px 0;padding:6px 0;}",
+    ".math-inline .katex{font-size:1em;}",
+    ".math-display{display:block;overflow-x:auto;overflow-y:hidden;margin:14px 0;padding:4px 0;}",
+    ".math-display .katex-display{margin:0;}",
+    ".math-display .katex{font-size:1.04em;}",
     ".math-fallback{color:var(--muted);}",
     "@media print{body{background:#ffffff;} .page{max-width:none;padding:0;} .hero-actions,.meta{display:none;} .message{box-shadow:none;break-inside:avoid-page;page-break-inside:avoid;} a{color:inherit;text-decoration:none;}}",
     "@media (max-width:720px){.hero{flex-direction:column;} .hero-actions{justify-content:flex-start;} .hero-text h1{font-size:34px;}}",
@@ -2120,7 +2433,7 @@ function renderMathExpression(expression, displayMode) {
         displayMode,
         throwOnError: false,
         strict: "ignore",
-        output: "mathml"
+        output: "htmlAndMathml"
       });
 
       return displayMode
@@ -2193,8 +2506,9 @@ function buildFileAttachmentHtml(attachment, assetLookup, fallbackIndex) {
 function buildImageAttachmentHtml(attachment, assetLookup, fallbackIndex) {
   const label = buildAttachmentMarkdownLabel(attachment, fallbackIndex);
   const dataUri = resolveAttachmentPreviewDataUri(attachment, assetLookup);
-  const href = resolveAttachmentHtmlHref(attachment, assetLookup) || formatHtmlHref(attachment.localPath);
-  const imageSource = dataUri || formatHtmlHref(attachment.localPath);
+  const localImageSource = formatHtmlHref(attachment.localPath);
+  const href = resolveAttachmentHtmlHref(attachment, assetLookup) || localImageSource;
+  const imageSource = localImageSource || dataUri;
 
   if (!imageSource) {
     return buildFileAttachmentHtml(attachment, assetLookup, fallbackIndex);
@@ -2246,13 +2560,6 @@ function resolveAttachmentMarkdownPreviewTarget(attachment, assetLookup) {
     return "";
   }
 
-  if (attachment?.localPath) {
-    const asset = assetLookup?.get(attachment.localPath);
-    if (asset?.dataUri) {
-      return asset.dataUri;
-    }
-  }
-
   return formatMarkdownLinkTarget(attachment.localPath || getPreferredAttachmentDownloadUrl(attachment));
 }
 
@@ -2298,12 +2605,13 @@ function shouldInlineHtmlAsset(asset) {
     return false;
   }
 
-  if (String(asset.mimeType || "").toLowerCase().startsWith("image/")) {
-    return true;
+  const mimeType = String(asset.mimeType || "").toLowerCase();
+  if (mimeType.startsWith("image/")) {
+    return false;
   }
 
   const bytesLength = asset.bytes instanceof ArrayBuffer ? asset.bytes.byteLength : 0;
-  return bytesLength > 0 && bytesLength <= 512 * 1024;
+  return bytesLength > 0 && bytesLength <= 64 * 1024 && /^(text\/|application\/json\b)/i.test(mimeType);
 }
 
 function buildAssetDataUri(asset) {
@@ -2330,11 +2638,6 @@ function arrayBufferToBase64(buffer) {
 
 function resolveAttachmentHtmlHref(attachment, assetLookup) {
   if (attachment?.localPath) {
-    const asset = assetLookup?.get(attachment.localPath);
-    if (asset?.dataUri) {
-      return asset.dataUri;
-    }
-
     return formatHtmlHref(attachment.localPath);
   }
 
@@ -2348,6 +2651,73 @@ function resolveAttachmentPreviewDataUri(attachment, assetLookup) {
   }
 
   return "";
+}
+
+async function buildConversationExportSupportFiles() {
+  try {
+    const katexCss = await readExtensionTextResource("vendor/katex.min.css");
+    const exportCss = buildExportKaTeXStylesheet(katexCss);
+    const fontFileNames = extractKaTeXFontFileNames(exportCss);
+    const files = [
+      {
+        localPath: "katex/katex.min.css",
+        body: exportCss
+      }
+    ];
+
+    for (const fontFileName of fontFileNames) {
+      const bytes = await readExtensionBinaryResource(`vendor/katex-fonts/${fontFileName}`);
+      files.push({
+        localPath: `katex/fonts/${fontFileName}`,
+        body: bytes
+      });
+    }
+
+    return {
+      files,
+      html: {
+        katexStylesheetPath: "katex/katex.min.css"
+      }
+    };
+  } catch (_error) {
+    return {
+      files: [],
+      html: {}
+    };
+  }
+}
+
+function buildExportKaTeXStylesheet(cssText) {
+  return String(cssText || "").replace(
+    /url\(fonts\/([^)"']+\.woff2)\)\s*format\("woff2"\)\s*,\s*url\(fonts\/[^)"']+\.woff\)\s*format\("woff"\)\s*,\s*url\(fonts\/[^)"']+\.ttf\)\s*format\("truetype"\)/g,
+    'url(fonts/$1) format("woff2")'
+  );
+}
+
+function extractKaTeXFontFileNames(cssText) {
+  return Array.from(
+    new Set(
+      Array.from(String(cssText || "").matchAll(/fonts\/([A-Za-z0-9_-]+\.woff2)/g)).map((match) => match[1])
+    )
+  );
+}
+
+async function readExtensionTextResource(path) {
+  const response = await fetch(chrome.runtime.getURL(path));
+  if (!response.ok) {
+    throw new Error(`Failed to read extension resource: ${path}`);
+  }
+
+  return response.text();
+}
+
+async function readExtensionBinaryResource(path) {
+  const response = await fetch(chrome.runtime.getURL(path));
+  if (!response.ok) {
+    throw new Error(`Failed to read extension resource: ${path}`);
+  }
+
+  return response.arrayBuffer();
 }
 
 function formatHtmlHref(value) {

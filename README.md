@@ -37,15 +37,19 @@ What works today:
 - current-chat export packages downloaded attachment/image binaries into a local
   zip when ChatGPT still exposes retrievable file URLs
 - packaged current-chat Markdown rewrites attachment links to local relative
-  paths when the files were successfully captured
+  paths when the files were successfully captured instead of embedding giant
+  `data:` URLs
 - current-chat export also includes a cleaner self-contained `HTML` reading view
   with a `Print / Save as PDF` button
 - the bundled `HTML` view now renders common Markdown structure and LaTeX-style
-  formulas more faithfully than the raw Markdown file
+  formulas more faithfully than the raw Markdown file, with offline KaTeX CSS
+  and fonts packaged into the export folder
 - current-chat zip now extracts into one top-level folder instead of scattering
   files directly into the destination
 - for `file_id` style references, the extension also records fallback download
   candidates from ChatGPT's same-site endpoints
+- duplicated attachment metadata and visible image entries are merged when they
+  point to the same uploaded file, which keeps exports cleaner
 
 What is still limited:
 
@@ -94,6 +98,7 @@ No external server is used.
   - `<topic title> - <local time>.json`
   - `<topic title> - <local time> - attachments.json`
   - `assets/...`
+  - `katex/...`
 
 The bundled `html` file is the cleanest reading view and the easiest way to
 save the conversation as PDF from your browser.
