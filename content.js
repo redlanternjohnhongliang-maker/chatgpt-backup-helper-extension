@@ -357,18 +357,20 @@ function normalizeMessageNode(node, index) {
 
 function toVisibleExportMessage(message) {
   const cleanedText = cleanExportMessageText(message.role, message.text);
-  if (!cleanedText) {
+  const normalizedAttachments = normalizeAttachmentList(message.attachments || []);
+
+  if (!cleanedText && !normalizedAttachments.length) {
     return null;
   }
 
-  if (!isVisibleExportMessage(message.role, cleanedText)) {
+  if (cleanedText && !isVisibleExportMessage(message.role, cleanedText)) {
     return null;
   }
 
   return {
     ...message,
     text: cleanedText,
-    attachments: normalizeAttachmentList(message.attachments || [])
+    attachments: normalizedAttachments
   };
 }
 
@@ -392,7 +394,6 @@ function summarizeUserAttachments(text) {
     return text;
   }
 
-  let attachmentCount = 0;
   const keptLines = [];
 
   for (const line of lines) {
@@ -401,15 +402,10 @@ function summarizeUserAttachments(text) {
     }
 
     if (line.startsWith("sediment://file_")) {
-      attachmentCount += 1;
       continue;
     }
 
     keptLines.push(line);
-  }
-
-  if (attachmentCount > 0) {
-    keptLines.unshift(`[${attachmentCount} attachment(s)]`);
   }
 
   return keptLines.join("\n");
@@ -1678,33 +1674,64 @@ function buildConversationFilename(payload, extension, stamp = createExportStamp
 }
 
 function buildConversationFileBase(payload, stamp = createExportStamp()) {
-  const title = slugify(payload.title || "chat");
-  return `chatgpt-${title}-${payload.conversationId}-${stamp}`;
+  return `${buildConversationFileTitle(payload)} - ${stamp}`;
 }
 
 function createExportStamp() {
-  return new Date().toISOString().replace(/[:.]/g, "-");
+  const now = new Date();
+  return [
+    now.getFullYear(),
+    padDatePart(now.getMonth() + 1),
+    padDatePart(now.getDate())
+  ].join("-") + " " + [
+    padDatePart(now.getHours()),
+    padDatePart(now.getMinutes()),
+    padDatePart(now.getSeconds())
+  ].join("-");
+}
+
+function buildConversationFileTitle(payload) {
+  const title = sanitizeFileName(normalizeWhitespace(payload?.title || "")) || "ChatGPT Conversation";
+  return title.slice(0, 96);
+}
+
+function padDatePart(value) {
+  return String(Number(value) || 0).padStart(2, "0");
+}
+
+function formatExportedAt(value) {
+  const date = value ? new Date(value) : new Date();
+  if (Number.isNaN(date.getTime())) {
+    return String(value || "");
+  }
+
+  return [
+    date.getFullYear(),
+    padDatePart(date.getMonth() + 1),
+    padDatePart(date.getDate())
+  ].join("-") + " " + [
+    padDatePart(date.getHours()),
+    padDatePart(date.getMinutes()),
+    padDatePart(date.getSeconds())
+  ].join(":");
 }
 
 function buildConversationMarkdown(payload, assetLookup = null) {
+  const exportedAt = formatExportedAt(payload.exportedAt);
   const lines = [
     `# ${payload.title}`,
     "",
-    "> Note: If local images do not load in your Markdown viewer, open the bundled HTML export or extract the ZIP first.",
-    "",
-    `- Exported at: ${payload.exportedAt}`,
-    `- Source: ${payload.source}`,
-    `- URL: ${payload.url}`,
-    `- Conversation ID: ${payload.conversationId}`,
-    `- Message count: ${payload.messageCount}`,
+    `_Exported on ${exportedAt}_`,
     ""
   ];
 
   for (const message of payload.messages) {
-    lines.push(`## ${formatRole(message.role)} ${message.index}`);
+    lines.push(`## ${formatMessageSpeaker(message.role)}`);
     lines.push("");
-    lines.push(message.text || "_empty_");
-    lines.push("");
+    if (message.text) {
+      lines.push(message.text);
+      lines.push("");
+    }
 
     const attachmentLines = buildMessageAttachmentMarkdownLines(message.attachments || [], assetLookup);
     if (attachmentLines.length) {
@@ -1717,6 +1744,7 @@ function buildConversationMarkdown(payload, assetLookup = null) {
 }
 
 function buildConversationHtml(payload, assetLookup) {
+  const exportedAt = formatExportedAt(payload.exportedAt);
   const sections = (payload.messages || [])
     .map((message) => buildConversationHtmlSection(message, assetLookup))
     .join("\n");
@@ -1729,42 +1757,74 @@ function buildConversationHtml(payload, assetLookup) {
     '<meta name="viewport" content="width=device-width, initial-scale=1">',
     `<title>${escapeHtml(payload.title || "ChatGPT Export")}</title>`,
     "<style>",
-    "body{font-family:Segoe UI,Arial,sans-serif;margin:32px auto;max-width:980px;padding:0 20px;color:#0f172a;background:#f8fafc;line-height:1.6;}",
-    "h1,h2{margin:0 0 12px;}",
-    ".meta{background:#ffffff;border:1px solid #e2e8f0;border-radius:14px;padding:18px 20px;margin-bottom:24px;}",
-    ".message{background:#ffffff;border:1px solid #e2e8f0;border-radius:14px;padding:20px;margin:0 0 18px;box-shadow:0 8px 24px rgba(15,23,42,0.04);}",
-    ".message pre{white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px;overflow:auto;}",
-    ".message p{margin:0 0 12px;}",
-    ".attachments{margin-top:16px;padding-top:12px;border-top:1px solid #e2e8f0;}",
-    ".attachments ul{margin:8px 0 0 22px;padding:0;}",
-    ".attachments li{margin:8px 0;}",
-    ".attachment-preview{display:block;max-width:100%;height:auto;margin-top:10px;border:1px solid #cbd5e1;border-radius:10px;background:#ffffff;}",
-    ".note{color:#475569;font-size:14px;margin-bottom:16px;}",
-    "a{color:#2563eb;text-decoration:none;}a:hover{text-decoration:underline;}",
+    ":root{color-scheme:light;--bg:#f3f6fb;--card:#ffffff;--text:#0f172a;--muted:#64748b;--line:#dbe4ee;--user-bg:#eaf4ff;--assistant-bg:#ffffff;--accent:#2563eb;}",
+    "*{box-sizing:border-box;}",
+    "body{margin:0;font-family:'Segoe UI',Arial,sans-serif;color:var(--text);background:linear-gradient(180deg,#eef4fb 0%,#f8fafc 100%);line-height:1.7;}",
+    ".page{max-width:960px;margin:0 auto;padding:32px 20px 56px;}",
+    ".hero{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:28px;}",
+    ".hero-text h1{margin:0;font-size:42px;line-height:1.1;letter-spacing:-0.02em;}",
+    ".hero-text p{margin:10px 0 0;color:var(--muted);font-size:15px;}",
+    ".hero-actions{display:flex;flex-wrap:wrap;gap:10px;justify-content:flex-end;}",
+    ".button{appearance:none;border:1px solid var(--line);background:var(--card);color:var(--text);padding:10px 14px;border-radius:999px;font-size:14px;cursor:pointer;text-decoration:none;box-shadow:0 8px 24px rgba(15,23,42,0.05);}",
+    ".button.primary{background:var(--accent);border-color:var(--accent);color:#ffffff;}",
+    ".meta{margin:0 0 28px;}",
+    ".meta details{background:rgba(255,255,255,0.7);border:1px solid var(--line);border-radius:14px;padding:12px 16px;}",
+    ".meta summary{cursor:pointer;color:var(--muted);font-size:14px;}",
+    ".meta ul{margin:12px 0 0 18px;padding:0;color:var(--muted);font-size:14px;}",
+    ".conversation{display:flex;flex-direction:column;gap:16px;}",
+    ".message{border:1px solid var(--line);border-radius:22px;padding:18px 20px;box-shadow:0 10px 30px rgba(15,23,42,0.05);background:var(--assistant-bg);}",
+    ".message.user{background:var(--user-bg);}",
+    ".message-header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px;}",
+    ".message-role{display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:700;letter-spacing:0.02em;text-transform:uppercase;color:var(--muted);}",
+    ".role-dot{width:10px;height:10px;border-radius:999px;background:var(--accent);display:inline-block;}",
+    ".message.user .role-dot{background:#0284c7;}",
+    ".message-body p{margin:0 0 12px;}",
+    ".message-body pre{white-space:pre-wrap;word-break:break-word;background:#f8fafc;border:1px solid var(--line);border-radius:14px;padding:14px;overflow:auto;margin:0 0 12px;}",
+    ".attachments{margin-top:14px;display:flex;flex-direction:column;gap:12px;}",
+    ".attachment-list{display:flex;flex-wrap:wrap;gap:10px;}",
+    ".attachment-link{display:inline-flex;align-items:center;gap:8px;max-width:100%;padding:10px 12px;border-radius:14px;background:#fff;border:1px solid var(--line);text-decoration:none;color:var(--text);}",
+    ".attachment-link span{overflow-wrap:anywhere;}",
+    ".attachment-preview{display:block;max-width:100%;height:auto;border:1px solid #cbd5e1;border-radius:16px;background:#ffffff;}",
+    "a{color:var(--accent);text-decoration:none;}a:hover{text-decoration:underline;}",
     "code{font-family:Consolas,Menlo,monospace;background:#eff6ff;border-radius:6px;padding:1px 5px;}",
+    "@media print{body{background:#ffffff;} .page{max-width:none;padding:0;} .hero-actions,.meta{display:none;} .message{box-shadow:none;break-inside:avoid-page;page-break-inside:avoid;} a{color:inherit;text-decoration:none;}}",
+    "@media (max-width:720px){.hero{flex-direction:column;} .hero-actions{justify-content:flex-start;} .hero-text h1{font-size:34px;}}",
     "</style>",
     "</head>",
     "<body>",
+    '<div class="page">',
+    '<header class="hero">',
+    '<div class="hero-text">',
     `<h1>${escapeHtml(payload.title || "ChatGPT Export")}</h1>`,
-    '<div class="meta">',
-    '<div class="note">This HTML preview is self-contained and is the safest way to view images when opening an export directly from inside a ZIP file.</div>',
-    `<ul><li>Exported at: ${escapeHtml(payload.exportedAt || "")}</li><li>Source: ${escapeHtml(payload.source || "")}</li><li>URL: <a href="${formatHtmlHref(payload.url || "")}">${escapeHtml(payload.url || "")}</a></li><li>Conversation ID: ${escapeHtml(payload.conversationId || "")}</li><li>Message count: ${escapeHtml(String(payload.messageCount || 0))}</li></ul>`,
+    `<p>Exported on ${escapeHtml(exportedAt)}. Open this file for the cleanest archive view, or use Print / Save as PDF.</p>`,
     "</div>",
-    sections,
+    '<div class="hero-actions">',
+    `<a class="button" href="${formatHtmlHref(payload.url || "")}" target="_blank" rel="noopener">Open Original Chat</a>`,
+    '<button class="button primary" type="button" onclick="window.print()">Print / Save as PDF</button>',
+    "</div>",
+    "</header>",
+    '<div class="meta"><details><summary>Archive details</summary>',
+    `<ul><li>Source: ${escapeHtml(payload.source || "")}</li><li>Conversation ID: ${escapeHtml(payload.conversationId || "")}</li><li>Message count: ${escapeHtml(String(payload.messageCount || 0))}</li><li>URL: <a href="${formatHtmlHref(payload.url || "")}">${escapeHtml(payload.url || "")}</a></li></ul>`,
+    "</details></div>",
+    `<main class="conversation">${sections}</main>`,
+    "</div>",
     "</body>",
     "</html>"
   ].join("\n");
 }
 
 function buildConversationHtmlSection(message, assetLookup) {
-  const heading = `${formatRole(message.role)} ${message.index}`;
+  const speaker = formatMessageSpeaker(message.role);
   const bodyHtml = renderConversationMessageTextHtml(message.text || "");
   const attachmentsHtml = buildMessageAttachmentHtml(message.attachments || [], assetLookup);
+  const roleClass = escapeHtmlAttribute(normalizeRoleClassName(message.role));
 
   return [
-    '<section class="message">',
-    `<h2>${escapeHtml(heading)}</h2>`,
-    bodyHtml || "<p><em>empty</em></p>",
+    `<section class="message ${roleClass}">`,
+    '<div class="message-header">',
+    `<div class="message-role"><span class="role-dot"></span><span>${escapeHtml(speaker)}</span></div>`,
+    "</div>",
+    `<div class="message-body">${bodyHtml || ""}</div>`,
     attachmentsHtml,
     "</section>"
   ].join("\n");
@@ -1822,50 +1882,67 @@ function buildMessageAttachmentHtml(attachments, assetLookup) {
     return "";
   }
 
-  const items = normalized.map((attachment, index) =>
-    buildSingleAttachmentHtml(attachment, assetLookup, index + 1)
-  );
+  const imageBlocks = [];
+  const fileLinks = [];
+
+  normalized.forEach((attachment, index) => {
+    if (isLikelyImageAttachment(attachment)) {
+      const imageBlock = buildImageAttachmentHtml(attachment, assetLookup, index + 1);
+      if (imageBlock) {
+        imageBlocks.push(imageBlock);
+      }
+      return;
+    }
+
+    const fileLink = buildFileAttachmentHtml(attachment, assetLookup, index + 1);
+    if (fileLink) {
+      fileLinks.push(fileLink);
+    }
+  });
+
+  const sections = [];
+  if (imageBlocks.length) {
+    sections.push(imageBlocks.join("\n"));
+  }
+  if (fileLinks.length) {
+    sections.push(`<div class="attachment-list">${fileLinks.join("\n")}</div>`);
+  }
+
+  if (!sections.length) {
+    return "";
+  }
 
   return [
     '<div class="attachments">',
-    "<strong>Attachments</strong>",
-    "<ul>",
-    items.join("\n"),
-    "</ul>",
+    sections.join("\n"),
     "</div>"
   ].join("\n");
 }
 
-function buildSingleAttachmentHtml(attachment, assetLookup, fallbackIndex) {
+function buildFileAttachmentHtml(attachment, assetLookup, fallbackIndex) {
   const label = buildAttachmentMarkdownLabel(attachment, fallbackIndex);
   const href = resolveAttachmentHtmlHref(attachment, assetLookup);
-  const preview = buildAttachmentPreviewHtml(attachment, assetLookup, label);
-  const meta = attachment.localPath
-    ? ` <code>${escapeHtml(attachment.localPath)}</code>`
-    : attachment.pointer
-      ? ` <code>${escapeHtml(attachment.pointer)}</code>`
-      : attachment.fileId
-        ? ` <code>${escapeHtml(attachment.fileId)}</code>`
-        : "";
 
   if (href) {
-    return `<li><a href="${href}" target="_blank" rel="noopener">${escapeHtml(label)}</a>${meta}${preview}</li>`;
+    return `<a class="attachment-link" href="${href}" target="_blank" rel="noopener"><span>${escapeHtml(label)}</span></a>`;
   }
 
-  return `<li>${escapeHtml(label)}${meta}${preview}</li>`;
+  return `<div class="attachment-link"><span>${escapeHtml(label)}</span></div>`;
 }
 
-function buildAttachmentPreviewHtml(attachment, assetLookup, label) {
-  if (!isLikelyImageAttachment(attachment)) {
-    return "";
-  }
-
+function buildImageAttachmentHtml(attachment, assetLookup, fallbackIndex) {
+  const label = buildAttachmentMarkdownLabel(attachment, fallbackIndex);
   const dataUri = resolveAttachmentPreviewDataUri(attachment, assetLookup);
   if (!dataUri) {
     return "";
   }
 
-  return `<img class="attachment-preview" alt="${escapeHtml(label)}" src="${dataUri}">`;
+  const href = resolveAttachmentHtmlHref(attachment, assetLookup) || dataUri;
+  return [
+    `<a href="${href}" target="_blank" rel="noopener">`,
+    `<img class="attachment-preview" alt="${escapeHtml(label)}" src="${dataUri}">`,
+    "</a>"
+  ].join("");
 }
 
 function buildMessageAttachmentMarkdownLines(attachments, assetLookup = null) {
@@ -1874,24 +1951,23 @@ function buildMessageAttachmentMarkdownLines(attachments, assetLookup = null) {
     return [];
   }
 
-  const lines = ["Attachments:"];
+  const lines = [];
   normalized.forEach((attachment, index) => {
     const label = buildAttachmentMarkdownLabel(attachment, index + 1);
     const localTarget = formatMarkdownLinkTarget(attachment.localPath);
     const preferredUrl = formatMarkdownLinkTarget(getPreferredAttachmentDownloadUrl(attachment));
     const previewTarget = resolveAttachmentMarkdownPreviewTarget(attachment, assetLookup);
 
-    if (localTarget) {
+    if (isLikelyImageAttachment(attachment) && (previewTarget || localTarget)) {
+      lines.push(`![${label}](${previewTarget || localTarget})`);
+    } else if (localTarget) {
       lines.push(`- [${label}](${localTarget})`);
-      if (isLikelyImageAttachment(attachment)) {
-        lines.push(`![${label}](${previewTarget || localTarget})`);
-      }
     } else if (preferredUrl) {
       lines.push(`- [${label}](${preferredUrl})`);
     } else if (attachment.pointer) {
-      lines.push(`- ${label} | ${attachment.pointer}`);
+      lines.push(`- ${label}`);
     } else if (attachment.fileId) {
-      lines.push(`- ${label} | ${attachment.fileId}`);
+      lines.push(`- ${label}`);
     } else {
       lines.push(`- ${label}`);
     }
@@ -1916,15 +1992,7 @@ function resolveAttachmentMarkdownPreviewTarget(attachment, assetLookup) {
 }
 
 function buildAttachmentMarkdownLabel(attachment, fallbackIndex) {
-  const preferredName =
-    sanitizeFileName(attachment?.name || "") ||
-    buildAttachmentName(attachment, fallbackIndex);
-
-  if (attachment?.mimeType) {
-    return `${preferredName} (${attachment.mimeType})`;
-  }
-
-  return preferredName;
+  return sanitizeFileName(attachment?.name || "") || buildAttachmentName(attachment, fallbackIndex);
 }
 
 function formatMarkdownLinkTarget(value) {
@@ -2100,6 +2168,28 @@ function formatRole(role) {
       return "Tool";
     default:
       return "Unknown";
+  }
+}
+
+function formatMessageSpeaker(role) {
+  switch (role) {
+    case "assistant":
+      return "ChatGPT";
+    case "user":
+      return "You";
+    default:
+      return formatRole(role);
+  }
+}
+
+function normalizeRoleClassName(role) {
+  switch (role) {
+    case "assistant":
+      return "assistant";
+    case "user":
+      return "user";
+    default:
+      return "unknown";
   }
 }
 

@@ -11,6 +11,7 @@ This is an unofficial tool and is not affiliated with OpenAI.
 ## What it can do
 
 - Export the current chat as a single local package zip with `Markdown + JSON + assets/`
+- Use topic-title-based filenames with local export time stamps
 - Export all visible conversations as a bulk `JSON archive + Markdown index`
 - Export a separate attachment manifest for the current chat
 - Build a bulk attachment index for all exported conversations
@@ -37,8 +38,8 @@ What works today:
   zip when ChatGPT still exposes retrievable file URLs
 - packaged current-chat Markdown rewrites attachment links to local relative
   paths when the files were successfully captured
-- extract the current-chat zip before opening the Markdown file if you want the
-  relative asset links to resolve locally
+- current-chat export also includes a cleaner self-contained `HTML` reading view
+  with a `Print / Save as PDF` button
 - for `file_id` style references, the extension also records fallback download
   candidates from ChatGPT's same-site endpoints
 
@@ -82,16 +83,16 @@ No external server is used.
 
 ### Current chat
 
-- `chatgpt-...zip`
+- `<topic title> - <local time>.zip`
 - zip contents include:
-  - `chatgpt-...html`
-  - `chatgpt-...md`
-  - `chatgpt-...json`
-  - `chatgpt-...attachments-...json`
+  - `<topic title> - <local time>.html`
+  - `<topic title> - <local time>.md`
+  - `<topic title> - <local time>.json`
+  - `<topic title> - <local time> - attachments.json`
   - `assets/...`
 
-The bundled `html` file is the safest way to preview images when you open an
-export directly from inside a `.zip` file on Windows.
+The bundled `html` file is the cleanest reading view and the easiest way to
+save the conversation as PDF from your browser.
 
 ### All chats
 

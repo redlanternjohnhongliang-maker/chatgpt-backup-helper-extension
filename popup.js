@@ -34,7 +34,7 @@ async function runAction(action) {
       const attachmentPart = response.result.attachmentCount
         ? ` Local attachments: ${response.result.downloadedAttachmentCount || 0}/${response.result.attachmentCount}.`
         : "";
-      setStatus(`Done. Packaged current chat: ${response.result.title}.${attachmentPart} Open the bundled HTML file for the most reliable preview.`);
+      setStatus(`Done. Packaged current chat: ${response.result.title}.${attachmentPart} Open the bundled HTML file for the cleanest view or save it as PDF.`);
     } else {
       const attachmentPart = response.result.attachmentCount
         ? ` Attachments indexed: ${response.result.attachmentCount}.`
